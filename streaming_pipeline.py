@@ -1,24 +1,18 @@
 from __future__ import annotations
 
-"""Bounded FFmpeg streaming pipeline used for low-resolution videos.
-
-FFmpeg decoder -> bounded RAM queue -> processor -> bounded RAM queue -> encoder.
-The processor hook is ready for the hand-drawing engine. The default processor
-is lossless pass-through so the infrastructure can be tested before the effect
-engine is connected.
-"""
+"""Bounded FFmpeg streaming pipeline used for low-resolution videos."""
 
 import subprocess
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from queue import Queue
+from queue import Empty, Full, Queue
 from typing import Callable, Optional
-
 
 MAX_STREAMING_HEIGHT = 1080
 DEFAULT_QUEUE_FRAMES = 4
+QUEUE_TIMEOUT = 0.10
 
 
 @dataclass
@@ -41,13 +35,11 @@ FrameProcessor = Callable[[bytes, int, int, int], bytes]
 
 
 def choose_queue_frames(width: int, height: int, ram_available: Optional[int]) -> int:
-    """Choose a small bounded queue from current RAM."""
     frame_bytes = max(1, width * height * 3)
     if ram_available is None:
         return DEFAULT_QUEUE_FRAMES
     budget = max(frame_bytes, ram_available // 32)
-    count = max(1, min(8, budget // frame_bytes))
-    return int(count)
+    return int(max(1, min(8, budget // frame_bytes)))
 
 
 def passthrough_processor(frame: bytes, index: int, width: int, height: int) -> bytes:
@@ -55,11 +47,6 @@ def passthrough_processor(frame: bytes, index: int, width: int, height: int) -> 
 
 
 def _read_exact(stream, size: int) -> bytes:
-    """Read exactly one raw frame from a pipe.
-
-    ``file.read(size)`` is not guaranteed to return size bytes for a pipe;
-    a short read is normal. Accumulate until one complete frame arrives or EOF.
-    """
     chunks: list[bytes] = []
     remaining = size
     while remaining:
@@ -83,6 +70,25 @@ def _terminate_process(process: subprocess.Popen[bytes]) -> None:
                 pass
 
 
+def _queue_put(queue, item, stop: threading.Event) -> bool:
+    while not stop.is_set():
+        try:
+            queue.put(item, timeout=QUEUE_TIMEOUT)
+            return True
+        except Full:
+            continue
+    return False
+
+
+def _queue_get(queue, stop: threading.Event):
+    while not stop.is_set():
+        try:
+            return queue.get(timeout=QUEUE_TIMEOUT)
+        except Empty:
+            continue
+    return None
+
+
 def run_streaming_pipeline(
     input_path: Path,
     output_path: Path,
@@ -96,11 +102,6 @@ def run_streaming_pipeline(
     progress_callback: Optional[Callable[[StreamingStats], None]] = None,
     stop_event: Optional[threading.Event] = None,
 ) -> StreamingStats:
-    """Stream frames with bounded memory usage.
-
-    No full video or full frame list is held in RAM. Queue capacity is bounded,
-    so a fast decoder cannot outrun a slower processing stage indefinitely.
-    """
     if width <= 0 or height <= 0:
         raise ValueError("ストリーミングには正しい解像度が必要です。")
     if fps <= 0:
@@ -118,32 +119,17 @@ def run_streaming_pipeline(
     errors: list[BaseException] = []
 
     decoder = subprocess.Popen(
-        [
-            "ffmpeg", "-hide_banner", "-loglevel", "error",
-            "-i", str(input_path),
-            "-map", "0:v:0",
-            "-f", "rawvideo", "-pix_fmt", "rgb24",
-            "-threads", str(max(1, threads)), "pipe:1",
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        bufsize=0,
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(input_path),
+         "-map", "0:v:0", "-f", "rawvideo", "-pix_fmt", "rgb24",
+         "-threads", str(max(1, threads)), "pipe:1"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,
     )
-
     encoder = subprocess.Popen(
-        [
-            "ffmpeg", "-hide_banner", "-loglevel", "error",
-            "-f", "rawvideo", "-pix_fmt", "rgb24",
-            "-s", f"{width}x{height}",
-            "-r", f"{fps:.12g}",
-            "-i", "pipe:0",
-            "-an",
-            "-c:v", "libx264", "-pix_fmt", "yuv420p",
-            "-threads", str(max(1, threads)), "-y", str(output_path),
-        ],
-        stdin=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        bufsize=0,
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "rawvideo",
+         "-pix_fmt", "rgb24", "-s", f"{width}x{height}", "-r", f"{fps:.12g}",
+         "-i", "pipe:0", "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+         "-threads", str(max(1, threads)), "-y", str(output_path)],
+        stdin=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,
     )
 
     def decoder_worker() -> None:
@@ -155,14 +141,14 @@ def run_streaming_pipeline(
                 if not frame:
                     break
                 if len(frame) != frame_size:
-                    raise RuntimeError(
-                        f"FFmpegから不完全なフレームを受信しました: {len(frame)}/{frame_size} bytes"
-                    )
-                raw_queue.put((index, frame))
+                    raise RuntimeError(f"FFmpegから不完全なフレームを受信しました: {len(frame)}/{frame_size} bytes")
+                if not _queue_put(raw_queue, (index, frame), stop):
+                    return
                 index += 1
-            raw_queue.put(None)
+            _queue_put(raw_queue, None, stop)
         except BaseException as exc:
-            errors.append(exc)
+            if not stop.is_set():
+                errors.append(exc)
             stop.set()
             try:
                 raw_queue.put_nowait(None)
@@ -172,17 +158,20 @@ def run_streaming_pipeline(
     def processor_worker() -> None:
         try:
             while not stop.is_set():
-                item = raw_queue.get()
+                item = _queue_get(raw_queue, stop)
                 if item is None:
-                    encoded_queue.put(None)
+                    if not stop.is_set():
+                        _queue_put(encoded_queue, None, stop)
                     return
                 index, frame = item
                 processed = processor(frame, index, width, height)
                 if len(processed) != frame_size:
                     raise RuntimeError("フレーム処理結果のサイズが元フレームと一致しません。")
-                encoded_queue.put((index, processed))
+                if not _queue_put(encoded_queue, (index, processed), stop):
+                    return
         except BaseException as exc:
-            errors.append(exc)
+            if not stop.is_set():
+                errors.append(exc)
             stop.set()
             try:
                 encoded_queue.put_nowait(None)
@@ -194,9 +183,10 @@ def run_streaming_pipeline(
             assert encoder.stdin is not None
             expected = 0
             while not stop.is_set():
-                item = encoded_queue.get()
+                item = _queue_get(encoded_queue, stop)
                 if item is None:
-                    encoder.stdin.close()
+                    if not stop.is_set():
+                        encoder.stdin.close()
                     return
                 index, frame = item
                 if index != expected:
@@ -206,12 +196,9 @@ def run_streaming_pipeline(
                 stats.frames = expected
                 if progress_callback:
                     progress_callback(stats)
-            try:
-                encoder.stdin.close()
-            except Exception:
-                pass
         except BaseException as exc:
-            errors.append(exc)
+            if not stop.is_set():
+                errors.append(exc)
             stop.set()
 
     workers = [
@@ -223,24 +210,30 @@ def run_streaming_pipeline(
         worker.start()
 
     try:
-        for worker in workers:
-            worker.join()
+        while any(worker.is_alive() for worker in workers):
+            if stop.is_set():
+                _terminate_process(decoder)
+                _terminate_process(encoder)
+            for worker in workers:
+                worker.join(timeout=QUEUE_TIMEOUT)
     finally:
         stop.set()
         _terminate_process(decoder)
         _terminate_process(encoder)
+        for worker in workers:
+            worker.join(timeout=1)
         decoder_err = decoder.stderr.read().decode("utf-8", errors="replace") if decoder.stderr else ""
         encoder_err = encoder.stderr.read().decode("utf-8", errors="replace") if encoder.stderr else ""
         stats.finished = time.perf_counter()
 
     if errors:
         raise RuntimeError(str(errors[0]))
+    if stop_event is not None and stop_event.is_set():
+        return stats
     if decoder.returncode not in (0, None):
         raise RuntimeError(f"FFmpeg decode failed:\n{decoder_err.strip()}")
     if encoder.returncode not in (0, None):
         raise RuntimeError(f"FFmpeg encode failed:\n{encoder_err.strip()}")
-    if stop_event is not None and stop_event.is_set():
-        return stats
     if frame_count and stats.frames != frame_count:
         raise RuntimeError(f"処理フレーム数が一致しません: {stats.frames}/{frame_count}")
     return stats
