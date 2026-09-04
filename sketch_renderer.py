@@ -41,17 +41,21 @@ def _stroke(draw, points, width, pen_type, fill):
     for x,y in (points[0],points[-1]): draw.ellipse((x-radius,y-radius,x+radius,y+radius),fill=fill)
 
 def _edge_strokes(gray, settings, sx, sy):
-    gx=np.zeros_like(gray,dtype=np.float32); gy=np.zeros_like(gray,dtype=np.float32)
-    gx[:,1:-1]=gray[:,2:].astype(np.float32)-gray[:,:-2].astype(np.float32); gy[1:-1,:]=gray[2:,:].astype(np.float32)-gray[:-2,:].astype(np.float32)
-    mag=np.hypot(gx,gy); threshold=np.percentile(mag,88.-18.*settings.detail); ys,xs=np.where(mag>=max(8.,threshold))
+    from gpu_backend import edge_magnitude
+    mag=edge_magnitude(gray)
+    threshold=np.percentile(mag,88.-18.*settings.detail); ys,xs=np.where(mag>=max(8.,threshold))
     max_points=max(500,int(gray.size*(.002+.004*settings.detail)))
     if len(xs)>max_points:
         stride=max(1,len(xs)//max_points); xs,ys=xs[::stride],ys[::stride]
     strokes=[]; step=max(1,int(2.5-settings.detail*1.5))
     for x,y in zip(xs[::step],ys[::step]):
-        dx,dy=float(gx[y,x]),float(gy[y,x]); length=math.hypot(dx,dy) or 1.; tx,ty=-dy/length,dx/length; span=2.+settings.detail*5.
+        gx=float(mag[y,x]); gy=float(mag[y,x])
+        # Direction is estimated locally on CPU from neighboring luminance.
+        left=float(gray[y,max(0,x-1)]); right=float(gray[y,min(gray.shape[1]-1,x+1)])
+        up=float(gray[max(0,y-1),x]); down=float(gray[min(gray.shape[0]-1,y+1),x])
+        dx=right-left; dy=down-up; length=math.hypot(dx,dy) or 1.; tx,ty=-dy/length,dx/length; span=2.+settings.detail*5.
         p1=((x-tx*span)*sx,(y-ty*span)*sy); p2=((x+tx*span)*sx,(y+ty*span)*sy)
-        strength=min(255,int(55+min(1.,mag[y,x]/160.)*170*settings.line_strength)); strokes.append((p1,p2,strength))
+        strength=min(255,int(55+min(1.,gx/160.)*170*settings.line_strength)); strokes.append((p1,p2,strength))
     return strokes
 
 def _color_dabs(analysis, settings, sx, sy):
@@ -73,13 +77,11 @@ def render_frame(frame,index,width,height,settings):
     for p1,p2,strength in _edge_strokes(gray,settings,sx,sy): _stroke(draw,[p1,p2],line_width,settings.pen_type,(25,25,25,strength))
     if settings.color_strength>.05:
         for (x,y),fill in _color_dabs(analysis,settings,sx,sy):
-            radius=max(1,line_width//2); draw.ellipse((x-radius,y-radius,x+radius,y+radius),fill=fill)
+            _stroke(draw,[(x-line_width*.35,y),(x+line_width*.35,y)],line_width,settings.pen_type,fill)
     return canvas.convert("RGB").resize((width,height),Image.Resampling.BICUBIC).tobytes()
 
 def make_processor(settings):
     normalized=settings.normalized()
     def processor(frame,index,width,height): return render_frame(frame,index,width,height,normalized)
-    # The parallel process runner uses this immutable settings object to create
-    # one renderer per worker instead of trying to pickle the closure itself.
     processor.pencil_settings=normalized
     return processor
