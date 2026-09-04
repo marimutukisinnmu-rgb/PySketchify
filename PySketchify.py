@@ -76,11 +76,15 @@ def default_output_path(input_path: Path) -> Path:
 def validate_input_path(path: Path) -> None:
     if not path.exists(): raise FileNotFoundError(f"入力ファイルがありません: {path}")
     if not path.is_file(): raise ValueError(f"入力先がファイルではありません: {path}")
+    if path.suffix.lower() not in SUPPORTED_INPUT_EXTENSIONS: raise ValueError(f"対応していない入力形式です: {path.suffix or '(拡張子なし)'}")
 
-def cleanup_default_temp(temp_dir: Path, was_default: bool) -> None:
-    if not was_default or not temp_dir.exists(): return
+def cleanup_temp(temp_dir: Path) -> None:
+    if not temp_dir.exists(): return
     try: shutil.rmtree(temp_dir)
     except OSError: pass
+
+def cleanup_default_temp(temp_dir: Path, was_default: bool) -> None:
+    if was_default: cleanup_temp(temp_dir)
 
 def find_executable(name: str) -> Optional[str]: return shutil.which(name)
 
@@ -112,8 +116,9 @@ def probe_video(path: Path) -> VideoInfo:
     width, height = int(video.get("width") or 0), int(video.get("height") or 0)
     fps = _ratio_to_float(video.get("avg_frame_rate") or video.get("r_frame_rate") or "0/1")
     duration = float(video.get("duration") or data.get("format", {}).get("duration") or 0.0)
-    raw = video.get("nb_frames")
-    frame_count = int(raw) if raw and str(raw).isdigit() else (max(1, round(fps * duration)) if fps > 0 and duration > 0 else 0)
+    frame_count = int(video.get("nb_frames")) if video.get("nb_frames") and str(video.get("nb_frames")).isdigit() else (max(1, round(fps * duration)) if fps > 0 and duration > 0 else 0)
+    if width <= 0 or height <= 0: raise RuntimeError("動画の解像度を取得できませんでした。")
+    if fps <= 0: raise RuntimeError("動画のFPSを取得できませんでした。")
     return VideoInfo(str(path), width, height, fps, duration, frame_count, str(video.get("pix_fmt") or "unknown"), str(video.get("codec_name") or "unknown"), sum(1 for s in streams if s.get("codec_type") == "audio"), sum(1 for s in streams if s.get("codec_type") == "subtitle"))
 
 def estimate_frame_bytes(width: int, height: int, bits: int = 8, channels: int = 3) -> int:
@@ -185,12 +190,25 @@ def extract_chunk(input_path: Path, output_path: Path, start_frame: int, end_fra
 
 class ProcessingSession:
     def __init__(self,input_path:Path,temp_dir:Optional[Path]=None,output_path:Optional[Path]=None):
-        self.input_path=input_path; self.temp_is_default=temp_dir is None or Path(temp_dir).resolve()==default_temp_dir().resolve(); self.temp_dir=Path(temp_dir).expanduser().resolve() if temp_dir else default_temp_dir(); self.output_path=Path(output_path).expanduser().resolve() if output_path else default_output_path(input_path); self.work_root=self.temp_dir/f"{input_path.stem}_pysketchify"; self.source_dir=self.work_root/"source_chunks"; self.processed_dir=self.work_root/"processed_chunks"; self.work_root.mkdir(parents=True,exist_ok=True); self.source_dir.mkdir(parents=True,exist_ok=True); self.processed_dir.mkdir(parents=True,exist_ok=True); self.stop_requested=False; self.stop_event=threading.Event()
-    def stop(self): self.stop_requested=True; self.stop_event.set()
+        self.input_path=input_path
+        self.temp_is_default=temp_dir is None or Path(temp_dir).resolve()==default_temp_dir().resolve()
+        self.temp_dir=Path(temp_dir).expanduser().resolve() if temp_dir else default_temp_dir()
+        self.output_path=Path(output_path).expanduser().resolve() if output_path else default_output_path(input_path)
+        self.work_root=self.temp_dir/f"{input_path.stem}_pysketchify"
+        self.source_dir=self.work_root/"source_chunks"
+        self.processed_dir=self.work_root/"processed_chunks"
+        self.work_root.mkdir(parents=True,exist_ok=True)
+        self.source_dir.mkdir(parents=True,exist_ok=True)
+        self.processed_dir.mkdir(parents=True,exist_ok=True)
+        self.stop_requested=False
+        self.stop_event=threading.Event()
+    def stop(self):
+        self.stop_requested=True
+        self.stop_event.set()
     def prepare(self):
         info=probe_video(self.input_path); plan=build_chunk_plan(info); required=add_safety_margin(sum(c.estimated_bytes for c in plan)); return info,plan,required
     def finish_cleanup(self):
-        if self.temp_is_default: cleanup_default_temp(self.temp_dir,True)
+        cleanup_temp(self.temp_dir)
 
 def print_video_info(info:VideoInfo):
     print("="*72); print(f"{APP_NAME} {VERSION}"); print("="*72); print(f"入力       : {info.path}"); print(f"解像度     : {info.width} × {info.height}"); print(f"入力FPS    : {info.fps:.6g} FPS"); print(f"時間       : {info.duration:.3f} 秒"); print(f"フレーム数 : {info.frame_count:,} 枚"); print(f"映像codec  : {info.codec}"); print(f"pixel fmt  : {info.pix_fmt}"); print(f"音声       : {info.audio_streams} track"); print(f"字幕       : {info.subtitle_streams} track"); print("="*72)
@@ -208,26 +226,27 @@ def run_lowres_streaming(info:VideoInfo,session:ProcessingSession,progress_callb
     return run_streaming_pipeline(session.input_path,session.output_path,info.width,info.height,info.fps,info.frame_count,queue_frames=q,threads=1,progress_callback=callback,stop_event=session.stop_event)
 
 def console_run(path:Path,temp_dir:Optional[Path]=None,output_path:Optional[Path]=None):
-    session=ProcessingSession(path,temp_dir=temp_dir,output_path=output_path); info,plan,required=session.prepare(); print_video_info(info); resources=get_resource_snapshot(); print(f"GPU        : {', '.join(resources.gpu_names) if resources.gpu_names else '検出情報なし'}"); print(f"RAM空き    : {format_bytes(resources.ram_available) if resources.ram_available is not None else '不明'}"); print(f"一時ファイル先 : {session.temp_dir}"); print(f"出力先         : {session.output_path}")
-    if info.height<=MAX_STREAMING_HEIGHT:
-        print("モード         : 1080p以下 / ストリーミング")
-        try: run_lowres_streaming(info,session)
-        finally: session.finish_cleanup()
-        return
-    print(f"チャンク数     : {len(plan):,}"); print(f"推定必要容量   : {format_bytes(required)}"); session.temp_dir.mkdir(parents=True,exist_ok=True); free=shutil.disk_usage(session.temp_dir).free; print(f"一時先空き容量 : {format_bytes(free)}")
-    if free<required: raise RuntimeError(f"ディスク容量不足です。必要推定 {format_bytes(required)} / 空き {format_bytes(free)}")
-    print("\nチャンク展開を開始します。"); started=time.perf_counter(); completed=0
+    session=ProcessingSession(path,temp_dir=temp_dir,output_path=output_path)
     try:
+        info,plan,required=session.prepare(); print_video_info(info); resources=get_resource_snapshot(); print(f"GPU        : {', '.join(resources.gpu_names) if resources.gpu_names else '検出情報なし'}"); print(f"RAM空き    : {format_bytes(resources.ram_available) if resources.ram_available is not None else '不明'}"); print(f"一時ファイル先 : {session.temp_dir}"); print(f"出力先         : {session.output_path}")
+        if info.height<=MAX_STREAMING_HEIGHT:
+            print("モード         : 1080p以下 / ストリーミング")
+            run_lowres_streaming(info,session)
+            return
+        print(f"チャンク数     : {len(plan):,}"); print(f"推定必要容量   : {format_bytes(required)}"); session.temp_dir.mkdir(parents=True,exist_ok=True); free=shutil.disk_usage(session.temp_dir).free; print(f"一時先空き容量 : {format_bytes(free)}")
+        if free<required: raise RuntimeError(f"ディスク容量不足です。必要推定 {format_bytes(required)} / 空き {format_bytes(free)}")
+        print("\nチャンク展開を開始します。"); started=time.perf_counter(); completed=0
         for chunk in plan:
             if session.stop_requested: break
             output=session.source_dir/chunk.filename
             if not output.exists() or output.stat().st_size==0: extract_chunk(session.input_path,output,chunk.start_frame,chunk.end_frame)
             completed+=chunk.frame_count; elapsed=max(0.001,time.perf_counter()-started); print(f"[{chunk.index}/{len(plan)}] {output.name} | {completed:,}/{info.frame_count:,} frame | {completed/elapsed:.1f} frame/s")
-    finally: session.finish_cleanup()
+    finally:
+        session.finish_cleanup()
 
 class PySketchifyApp:
     def __init__(self,root:tk.Tk):
-        self.root=root; self.root.title(f"{APP_NAME} {VERSION}"); self.root.geometry("1060x760"); self.session=None; self.info=None; self.plan=[]; self.completed_frames=0; self.processing_frames=0; self.waiting_frames=0; self.input_var=tk.StringVar(); self.temp_var=tk.StringVar(value=str(default_temp_dir())); self.output_var=tk.StringVar(); self.status_var=tk.StringVar(value="入力動画を選択してください。"); self.progress_var=tk.DoubleVar(value=0); self.stats_var=tk.StringVar(value="処理済み：0 枚  処理中：0 枚  処理待ち：0 枚"); self.resource_var=tk.StringVar(); self.info_var=tk.StringVar(value="未選択"); self._build()
+        self.root=root; self.root.title(f"{APP_NAME} {VERSION}"); self.root.geometry("1060x760"); self.session=None; self.info=None; self.plan=[]; self.completed_frames=0; self.processing_frames=0; self.waiting_frames=0; self.input_var=tk.StringVar(); self.temp_var=tk.StringVar(value=str(default_temp_dir())); self.output_var=tk.StringVar(); self.status_var=tk.StringVar(value="入力動画を選択してください。"); self.progress_var=tk.DoubleVar(value=0); self.stats_var=tk.StringVar(value="処理済み：0 枚  処理中：0 枚  処理待ち：0 枚"); self.resource_var=tk.StringVar(); self.info_var=tk.StringVar(value="未選択"); self._build(); self.root.protocol("WM_DELETE_WINDOW", self.close)
     def _path_row(self,parent,label,variable,command,button_text="参照"):
         row=ttk.Frame(parent); row.pack(fill="x",pady=4); ttk.Label(row,text=label,width=22).pack(side="left"); ttk.Entry(row,textvariable=variable).pack(side="left",fill="x",expand=True); ttk.Button(row,text=button_text,command=command).pack(side="left",padx=(8,0))
     def _build(self):
@@ -270,7 +289,7 @@ class PySketchifyApp:
                 self.waiting_frames=max(0,self.info.frame_count-self.completed_frames); self.root.after(0,self._update_live_counts)
         except Exception as exc: self.root.after(0,self._worker_error,str(exc)); return
         finally:
-            if self.session and self.info.height<=MAX_STREAMING_HEIGHT and not self.session.stop_requested: self.session.finish_cleanup()
+            if self.session: self.session.finish_cleanup()
         self.root.after(0,self._worker_done)
     def _update_live_counts(self): self.stats_var.set(f"処理済み：{self.completed_frames:,} 枚  処理中：{self.processing_frames:,} 枚  処理待ち：{self.waiting_frames:,} 枚")
     def _update_stream_progress(self,percent,speed): self.progress_var.set(percent); self._update_live_counts(); self.status_var.set(f"ストリーミング処理中... | {speed:.1f} frame/s")
@@ -280,6 +299,18 @@ class PySketchifyApp:
     def _worker_error(self,message): self.status_var.set(f"エラー: {message}"); self.start_button.config(state="normal"); self.stop_button.config(state="disabled"); messagebox.showerror(APP_NAME,message)
     def stop(self):
         if self.session: self.session.stop(); self.status_var.set("停止要求を送信しました。FFmpegを停止しています。")
+    def close(self):
+        if self.session and self.session.stop_event.is_set() is False:
+            self.session.stop()
+            self.status_var.set("終了処理中... FFmpegを停止しています。")
+            self.root.after(100, self._close_when_stopped)
+            return
+        self.root.destroy()
+    def _close_when_stopped(self):
+        if self.session and self.session.stop_event.is_set():
+            self.root.destroy()
+        else:
+            self.root.after(100, self._close_when_stopped)
 
 def main():
     if len(sys.argv)>1:
