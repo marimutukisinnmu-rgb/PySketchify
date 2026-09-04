@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -167,7 +168,6 @@ def run_video(info:VideoInfo,session:ProcessingSession,settings,progress_callbac
     if run_streaming_pipeline is None or make_processor is None: raise RuntimeError("必要なモジュールを読み込めません。streaming_pipeline.py / sketch_renderer.py を確認してください。")
     resources=get_resource_snapshot()
     q=choose_queue_frames(info.width,info.height,resources.ram_available) if choose_queue_frames else 1
-    # High-resolution frames are intentionally kept to a tiny bounded queue.
     if info.width*info.height*3>30_000_000: q=1
     print(f"[STREAM] {info.width}x{info.height} | queue={q} frame | RAM空き={format_bytes(resources.ram_available) if resources.ram_available else '不明'}")
     processor=make_processor(settings); last=[0.0]
@@ -248,9 +248,9 @@ class PySketchifyApp:
     def _worker_done(self): self.status_var.set("完了: " + (str(self.session.output_path) if self.session else "")); self.start_button.config(state="normal"); self.stop_button.config(state="disabled")
     def _worker_error(self,message): self.status_var.set(f"エラー: {message}"); self.start_button.config(state="normal"); self.stop_button.config(state="disabled"); messagebox.showerror(APP_NAME,message)
     def stop(self):
-        if self.session: self.session.stop(); self.status_var.set("停止要求を送信しました。FFmpegを停止しています。")
+        if self.session: self.session.stop(); self.status_var.set("停止要求を送信しました。Worker / FFmpegを停止しています。")
     def close(self):
-        if self.session and not self.session.stop_event.is_set(): self.session.stop(); self.status_var.set("終了処理中... FFmpegを停止しています。"); self.root.after(100,self._close_when_stopped); return
+        if self.session and not self.session.stop_event.is_set(): self.session.stop(); self.status_var.set("終了処理中... Worker / FFmpegを停止しています。"); self.root.after(100,self._close_when_stopped); return
         self.root.destroy()
     def _close_when_stopped(self):
         if self.session and self.session.stop_event.is_set(): self.root.destroy()
@@ -260,8 +260,39 @@ def main():
     if len(sys.argv)>1:
         input_path=Path(sys.argv[1]).expanduser().resolve(); temp_dir=Path(sys.argv[2]).expanduser().resolve() if len(sys.argv)>2 else None; output_path=Path(sys.argv[3]).expanduser().resolve() if len(sys.argv)>3 else None
         if PencilSettings is None: raise RuntimeError("numpy / Pillow が必要です。pip install numpy pillow")
-        info=probe_video(input_path); session=ProcessingSession(input_path,temp_dir=temp_dir,output_path=output_path); run_video(info,session,PencilSettings()); session.finish_cleanup(); return
+        info=probe_video(input_path); session=ProcessingSession(input_path,temp_dir=temp_dir,output_path=output_path)
+        try:
+            run_video(info,session,PencilSettings())
+        finally:
+            session.stop()
+            session.finish_cleanup()
+        return
     if tk is None: print("Tkinterが利用できません。動画ファイルを引数に指定してください。"); return
-    root=tk.Tk(); PySketchifyApp(root); root.mainloop()
+    root=tk.Tk(); app=PySketchifyApp(root)
+
+    def handle_sigint(signum, frame):
+        # Ctrl+C is a stop request, not an abrupt interpreter shutdown.
+        if app.session is not None:
+            print("[STOP] Ctrl+C を受信しました。停止処理を開始します。")
+            app.stop()
+        else:
+            print("[STOP] Ctrl+C を受信しました。終了します。")
+            root.after(0, root.destroy)
+
+    previous_sigint = signal.getsignal(signal.SIGINT)
+    signal.signal(signal.SIGINT, handle_sigint)
+    try:
+        root.mainloop()
+    except KeyboardInterrupt:
+        # Keep a final safety net: never let multiprocessing atexit handle an active run.
+        app.stop()
+        try:
+            root.update()
+        except Exception:
+            pass
+    finally:
+        signal.signal(signal.SIGINT, previous_sigint)
+        if app.session is not None:
+            app.session.stop()
 
 if __name__=="__main__": main()
