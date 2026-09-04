@@ -1,15 +1,13 @@
 from __future__ import annotations
 
 import json
-import math
 import os
 import shutil
 import subprocess
 import sys
-import tempfile
 import threading
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -24,9 +22,10 @@ except ImportError:
 
 
 APP_NAME = "PySketchify"
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 DEFAULT_MARGIN_GB = 0.9
 DEFAULT_CHUNK_TARGET_GB = 2.0
+DEFAULT_COMPRESSION_RATIO = 0.40
 SUPPORTED_INPUT_EXTENSIONS = {
     ".mp4", ".webm", ".mov", ".wmv", ".avi", ".mkv", ".mts", ".m2ts", ".avchd"
 }
@@ -64,6 +63,7 @@ class ResourceSnapshot:
     vram_dedicated_used: Optional[int]
     vram_shared_total: Optional[int]
     vram_shared_used: Optional[int]
+    gpu_names: tuple[str, ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -114,19 +114,24 @@ def _ratio_to_float(value: str) -> float:
 
 def probe_video(path: Path) -> VideoInfo:
     _, ffprobe = require_ffmpeg()
-    command = [
-        ffprobe,
-        "-v", "error",
-        "-print_format", "json",
-        "-show_streams",
-        "-show_format",
-        str(path),
-    ]
-    result = run_command(command)
+    result = run_command(
+        [
+            ffprobe,
+            "-v", "error",
+            "-print_format", "json",
+            "-show_streams",
+            "-show_format",
+            str(path),
+        ]
+    )
     if result.returncode != 0:
         raise RuntimeError(f"FFprobe failed:\n{result.stderr.strip()}")
 
-    data = json.loads(result.stdout)
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("FFprobeのJSON解析に失敗しました。") from exc
+
     streams = data.get("streams", [])
     video = next((s for s in streams if s.get("codec_type") == "video"), None)
     if video is None:
@@ -173,27 +178,29 @@ def estimate_png_bytes(
     width: int,
     height: int,
     frame_count: int,
-    compression_ratio: float = 0.4,
+    compression_ratio: float = DEFAULT_COMPRESSION_RATIO,
     bits: int = 8,
 ) -> int:
-    raw_per_frame = estimate_frame_bytes(width, height, bits=bits)
-    return max(0, int(raw_per_frame * compression_ratio * frame_count))
+    if compression_ratio < 0:
+        raise ValueError("compression_ratio は0以上で指定してください。")
+    return max(
+        0,
+        int(estimate_frame_bytes(width, height, bits=bits) * compression_ratio * frame_count),
+    )
 
 
 def estimate_chunk_bytes(
     width: int,
     height: int,
     frame_count: int,
-    compression_ratio: float = 0.4,
+    compression_ratio: float = DEFAULT_COMPRESSION_RATIO,
     bits: int = 8,
 ) -> int:
-    # This is intentionally an estimate only. Actual lossless video chunk size
-    # depends heavily on content and codec settings.
     return estimate_png_bytes(width, height, frame_count, compression_ratio, bits)
 
 
 def add_safety_margin(bytes_required: int, margin_gb: float = DEFAULT_MARGIN_GB) -> int:
-    return bytes_required + int(margin_gb * 1024**3)
+    return max(0, bytes_required) + int(margin_gb * 1024**3)
 
 
 def format_bytes(value: int | float) -> str:
@@ -220,11 +227,10 @@ def get_ram_snapshot() -> tuple[Optional[int], Optional[int]]:
         return None, None
 
 
-def _powershell_json(script: str) -> Optional[dict]:
+def _powershell_json(script: str) -> object | None:
     if os.name != "nt":
         return None
-    command = ["powershell", "-NoProfile", "-Command", script]
-    result = run_command(command)
+    result = run_command(["powershell", "-NoProfile", "-Command", script])
     if result.returncode != 0 or not result.stdout.strip():
         return None
     try:
@@ -235,30 +241,30 @@ def _powershell_json(script: str) -> Optional[dict]:
 
 def get_windows_gpu_snapshot() -> ResourceSnapshot:
     ram_total, ram_available = get_ram_snapshot()
-
     script = (
         "Get-CimInstance Win32_VideoController | "
-        "Select-Object Name,AdapterRAM,CurrentHorizontalResolution,CurrentVerticalResolution | "
-        "ConvertTo-Json -Compress"
+        "Select-Object Name,AdapterRAM | ConvertTo-Json -Compress"
     )
     data = _powershell_json(script)
     if not data:
-        return ResourceSnapshot(ram_total, ram_available, None, None, None, None)
+        return ResourceSnapshot(ram_total, ram_available, None, None, None, None, ())
 
     if isinstance(data, dict):
         data = [data]
 
     dedicated_total = 0
-    names = []
-    for gpu in data:
+    names: list[str] = []
+    for gpu in data if isinstance(data, list) else []:
+        if not isinstance(gpu, dict):
+            continue
         try:
             dedicated_total += int(gpu.get("AdapterRAM") or 0)
         except (TypeError, ValueError):
             pass
-        names.append(str(gpu.get("Name") or ""))
+        name = str(gpu.get("Name") or "").strip()
+        if name:
+            names.append(name)
 
-    # WMI AdapterRAM is not a reliable live VRAM usage metric. Keep usage as
-    # unknown rather than inventing it. Shared memory is also OS-managed.
     return ResourceSnapshot(
         ram_total=ram_total,
         ram_available=ram_available,
@@ -266,6 +272,7 @@ def get_windows_gpu_snapshot() -> ResourceSnapshot:
         vram_dedicated_used=None,
         vram_shared_total=None,
         vram_shared_used=None,
+        gpu_names=tuple(names),
     )
 
 
@@ -273,7 +280,7 @@ def get_resource_snapshot() -> ResourceSnapshot:
     if os.name == "nt":
         return get_windows_gpu_snapshot()
     ram_total, ram_available = get_ram_snapshot()
-    return ResourceSnapshot(ram_total, ram_available, None, None, None, None)
+    return ResourceSnapshot(ram_total, ram_available, None, None, None, None, ())
 
 
 # ---------------------------------------------------------------------------
@@ -282,14 +289,9 @@ def get_resource_snapshot() -> ResourceSnapshot:
 
 
 def choose_chunk_frame_count(info: VideoInfo, target_gb: float = DEFAULT_CHUNK_TARGET_GB) -> int:
-    # Conservative estimate based on 8-bit RGB. This is only a planning value;
-    # actual chunk sizes are checked while FFmpeg creates them.
     estimated_per_frame = max(1, estimate_frame_bytes(info.width, info.height))
     target_bytes = max(64 * 1024**2, int(target_gb * 1024**3))
     count = max(1, target_bytes // estimated_per_frame)
-
-    # Avoid gigantic chunk counts at low resolutions while keeping high-res
-    # chunks reasonably small.
     return int(max(1, min(count, 100_000)))
 
 
@@ -304,14 +306,13 @@ def build_chunk_plan(info: VideoInfo, target_gb: float = DEFAULT_CHUNK_TARGET_GB
     while start <= info.frame_count:
         end = min(info.frame_count, start + chunk_frames - 1)
         count = end - start + 1
-        estimate = estimate_chunk_bytes(info.width, info.height, count)
         plan.append(
             ChunkPlan(
                 index=index,
                 start_frame=start,
                 end_frame=end,
                 frame_count=count,
-                estimated_bytes=estimate,
+                estimated_bytes=estimate_chunk_bytes(info.width, info.height, count),
                 filename=f"frame-{start:08d}-{end:08d}.mkv",
             )
         )
@@ -326,6 +327,7 @@ def save_manifest(work_dir: Path, info: VideoInfo, plan: list[ChunkPlan], requir
         "version": VERSION,
         "video": asdict(info),
         "estimated_required_bytes": required_bytes,
+        "safety_margin_gb": DEFAULT_MARGIN_GB,
         "chunks": [asdict(chunk) for chunk in plan],
     }
     path = work_dir / "manifest.json"
@@ -338,42 +340,33 @@ def save_manifest(work_dir: Path, info: VideoInfo, plan: list[ChunkPlan], requir
 # ---------------------------------------------------------------------------
 
 
-def extract_chunk(
-    input_path: Path,
-    output_path: Path,
-    start_frame: int,
-    end_frame: int,
-    fps: float,
-    progress_callback=None,
-) -> None:
+def extract_chunk(input_path: Path, output_path: Path, start_frame: int, end_frame: int) -> None:
     ffmpeg, _ = require_ffmpeg()
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # FFV1 in Matroska is used as a lossless intermediate. This intentionally
-    # avoids generation loss while the hand-drawing stage is developed.
-    vf = f"select=between(n\\,{start_frame - 1}\\,{end_frame - 1})"
-    command = [
-        ffmpeg,
-        "-hide_banner",
-        "-loglevel", "error",
-        "-i", str(input_path),
-        "-vf", vf,
-        "-vsync", "0",
-        "-an",
-        "-c:v", "ffv1",
-        "-level", "3",
-        "-g", "1",
-        "-threads", "0",
-        "-y",
-        str(output_path),
-    ]
+    if end_frame < start_frame:
+        raise ValueError("end_frame は start_frame 以上である必要があります。")
 
-    result = run_command(command)
+    vf = f"select=between(n\\,{start_frame - 1}\\,{end_frame - 1})"
+    result = run_command(
+        [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel", "error",
+            "-i", str(input_path),
+            "-vf", vf,
+            "-vsync", "0",
+            "-an",
+            "-c:v", "ffv1",
+            "-level", "3",
+            "-g", "1",
+            "-threads", "0",
+            "-y",
+            str(output_path),
+        ]
+    )
     if result.returncode != 0:
         raise RuntimeError(f"チャンク作成失敗: {output_path.name}\n{result.stderr.strip()}")
-
-    if progress_callback:
-        progress_callback(output_path)
 
 
 # ---------------------------------------------------------------------------
@@ -398,29 +391,25 @@ class ProcessingSession:
     def prepare(self) -> tuple[VideoInfo, list[ChunkPlan], int]:
         info = probe_video(self.input_path)
         plan = build_chunk_plan(info)
-        estimated = sum(chunk.estimated_bytes for chunk in plan)
-        required = add_safety_margin(estimated)
+        required = add_safety_margin(sum(chunk.estimated_bytes for chunk in plan))
         save_manifest(self.work_root, info, plan, required)
         return info, plan, required
 
     def run_extraction(self, info: VideoInfo, plan: list[ChunkPlan], progress_callback=None):
+        completed = 0
         for chunk in plan:
             if self.stop_requested:
                 break
             output = self.source_dir / chunk.filename
             if output.exists() and output.stat().st_size > 0:
+                completed += chunk.frame_count
                 if progress_callback:
-                    progress_callback(chunk, output, "exists")
+                    progress_callback(chunk, output, "exists", completed, info.frame_count)
                 continue
-            extract_chunk(
-                self.input_path,
-                output,
-                chunk.start_frame,
-                chunk.end_frame,
-                info.fps,
-            )
+            extract_chunk(self.input_path, output, chunk.start_frame, chunk.end_frame)
+            completed += chunk.frame_count
             if progress_callback:
-                progress_callback(chunk, output, "created")
+                progress_callback(chunk, output, "created", completed, info.frame_count)
 
 
 # ---------------------------------------------------------------------------
@@ -449,8 +438,16 @@ def console_run(path: Path):
     info, plan, required = session.prepare()
     print_video_info(info)
 
+    resources = get_resource_snapshot()
+    print(f"GPU        : {', '.join(resources.gpu_names) if resources.gpu_names else '検出情報なし'}")
+    if resources.ram_available is not None:
+        print(f"RAM空き    : {format_bytes(resources.ram_available)}")
+    if resources.vram_dedicated_total is not None:
+        print(f"専用VRAM   : {format_bytes(resources.vram_dedicated_total)}")
+
+    estimated = sum(c.estimated_bytes for c in plan)
     print(f"チャンク数           : {len(plan):,}")
-    print(f"推定フレーム容量     : {format_bytes(sum(c.estimated_bytes for c in plan))}")
+    print(f"推定チャンク容量     : {format_bytes(estimated)}")
     print(f"安全余裕             : +{DEFAULT_MARGIN_GB:.1f} GB")
     print(f"推定必要容量         : {format_bytes(required)}")
     print(f"作業フォルダ         : {session.work_root}")
@@ -463,26 +460,25 @@ def console_run(path: Path):
         )
 
     print("\nチャンク展開を開始します。")
-
-    total = len(plan)
     started = time.perf_counter()
+    completed_frames = 0
 
-    def progress(chunk: ChunkPlan, output: Path, state: str):
-        done = chunk.index
+    def progress(chunk: ChunkPlan, output: Path, state: str, done_frames: int, total_frames: int):
+        nonlocal completed_frames
+        completed_frames = done_frames
         elapsed = max(0.001, time.perf_counter() - started)
-        frame_done = min(info.frame_count, chunk.end_frame)
-        speed = frame_done / elapsed
+        speed = done_frames / elapsed
         print(
-            f"[{done:>5}/{total:<5}] {output.name} | "
-            f"{frame_done:,}/{info.frame_count:,} frame | {speed:.1f} frame/s | {state}"
+            f"[{chunk.index:>5}/{len(plan):<5}] {output.name} | "
+            f"{done_frames:,}/{total_frames:,} frame | {speed:.1f} frame/s | {state}"
         )
 
     session.run_extraction(info, plan, progress)
-    print("完了。")
+    print(f"完了: {completed_frames:,}/{info.frame_count:,} frame")
 
 
 # ---------------------------------------------------------------------------
-# Minimal GUI
+# GUI
 # ---------------------------------------------------------------------------
 
 
@@ -490,15 +486,19 @@ class PySketchifyApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title(f"{APP_NAME} {VERSION}")
-        self.root.geometry("900x620")
+        self.root.geometry("980x700")
         self.session: Optional[ProcessingSession] = None
         self.info: Optional[VideoInfo] = None
         self.plan: list[ChunkPlan] = []
+        self.completed_frames = 0
+        self.processing_frames = 0
+        self.waiting_frames = 0
 
         self.path_var = tk.StringVar(value="")
         self.status_var = tk.StringVar(value="動画を選択してください。")
         self.progress_var = tk.DoubleVar(value=0.0)
         self.stats_var = tk.StringVar(value="")
+        self.resource_var = tk.StringVar(value="")
 
         self._build()
 
@@ -508,7 +508,7 @@ class PySketchifyApp:
         main.pack(fill="both", expand=True)
 
         ttk.Label(main, text=APP_NAME, font=("Segoe UI", 20, "bold")).pack(anchor="w")
-        ttk.Label(main, text="動画 → 手描き風動画変換基盤 / v0.1", font=("Segoe UI", 10)).pack(anchor="w", pady=(0, 12))
+        ttk.Label(main, text="動画 → 手描き風動画変換基盤", font=("Segoe UI", 10)).pack(anchor="w", pady=(0, 12))
 
         select = ttk.Frame(main)
         select.pack(fill="x")
@@ -519,13 +519,15 @@ class PySketchifyApp:
         info_frame.pack(fill="x", pady=12)
         self.info_label = ttk.Label(info_frame, text="未選択")
         self.info_label.pack(anchor="w")
+        ttk.Label(info_frame, textvariable=self.resource_var).pack(anchor="w", pady=(6, 0))
 
-        self.canvas_frame = ttk.LabelFrame(main, text="処理プレビュー（後続実装）", padding=10)
+        self.canvas_frame = ttk.LabelFrame(main, text="処理中 / プレビュー", padding=10)
         self.canvas_frame.pack(fill="both", expand=True)
         ttk.Label(
             self.canvas_frame,
-            text="ここに最新X枚のフレームをペイントアプリ風に表示します。",
+            text="最新X枚のフレームをペイントアプリ風に表示する領域。\n手描き処理エンジン接続時に実フレームを表示します。",
             anchor="center",
+            justify="center",
         ).pack(fill="both", expand=True)
 
         ttk.Progressbar(main, variable=self.progress_var, maximum=100).pack(fill="x", pady=(10, 4))
@@ -549,24 +551,41 @@ class PySketchifyApp:
         )
         if not path:
             return
-        self.path_var.set(path)
+
+        selected = Path(path)
+        if selected.suffix.lower() not in SUPPORTED_INPUT_EXTENSIONS:
+            proceed = messagebox.askyesno(
+                APP_NAME,
+                "拡張子は標準対応一覧にありません。FFmpegで読み込める可能性があります。続行しますか？",
+            )
+            if not proceed:
+                return
+
+        self.path_var.set(str(selected))
         try:
-            self.info = probe_video(Path(path))
+            self.info = probe_video(selected)
             self.plan = build_chunk_plan(self.info)
             estimated = sum(c.estimated_bytes for c in self.plan)
             required = add_safety_margin(estimated)
-            free = shutil.disk_usage(Path(path).parent).free
+            free = shutil.disk_usage(selected.parent).free
+            resources = get_resource_snapshot()
+            gpu_text = ", ".join(resources.gpu_names) if resources.gpu_names else "検出情報なし"
+            ram_text = format_bytes(resources.ram_available) if resources.ram_available is not None else "不明"
+            vram_text = format_bytes(resources.vram_dedicated_total) if resources.vram_dedicated_total is not None else "不明"
             self.info_label.config(
                 text=(
                     f"{self.info.width} × {self.info.height} | "
                     f"{self.info.fps:.6g} FPS | {self.info.frame_count:,} frame | "
                     f"audio {self.info.audio_streams} | subtitle {self.info.subtitle_streams}\n"
-                    f"チャンク {len(self.plan):,} 個 | 推定 {format_bytes(required)} | "
+                    f"チャンク {len(self.plan):,} 個 | 推定必要容量 {format_bytes(required)} | "
                     f"空き {format_bytes(free)}"
                 )
             )
+            self.resource_var.set(f"GPU: {gpu_text} | RAM空き: {ram_text} | 専用VRAM総量: {vram_text}")
             self.status_var.set("解析完了。")
         except Exception as exc:
+            self.info = None
+            self.plan = []
             self.status_var.set(f"解析エラー: {exc}")
             messagebox.showerror(APP_NAME, str(exc))
 
@@ -596,40 +615,61 @@ class PySketchifyApp:
         self.start_button.config(state="disabled")
         self.stop_button.config(state="normal")
         self.progress_var.set(0)
+        self.completed_frames = 0
+        self.processing_frames = 0
+        self.waiting_frames = self.info.frame_count
+        self._update_live_counts()
         threading.Thread(target=self._worker, daemon=True).start()
 
     def _worker(self):
         assert self.session is not None
         assert self.info is not None
-        total = len(self.plan)
         started = time.perf_counter()
 
         for chunk in self.plan:
             if self.session.stop_requested:
                 break
+
             output = self.session.source_dir / chunk.filename
             try:
-                if not output.exists():
-                    extract_chunk(self.session.input_path, output, chunk.start_frame, chunk.end_frame, self.info.fps)
-                done = chunk.index
+                if output.exists() and output.stat().st_size > 0:
+                    self.completed_frames += chunk.frame_count
+                    self.processing_frames = 0
+                    self.waiting_frames = max(0, self.info.frame_count - self.completed_frames)
+                    state = "exists"
+                else:
+                    self.processing_frames = chunk.frame_count
+                    self.waiting_frames = max(0, self.info.frame_count - self.completed_frames - self.processing_frames)
+                    self.root.after(0, self._update_live_counts)
+                    extract_chunk(self.session.input_path, output, chunk.start_frame, chunk.end_frame)
+                    self.completed_frames += chunk.frame_count
+                    self.processing_frames = 0
+                    self.waiting_frames = max(0, self.info.frame_count - self.completed_frames)
+                    state = "created"
+
                 elapsed = max(0.001, time.perf_counter() - started)
-                speed = min(self.info.frame_count, chunk.end_frame) / elapsed
-                percent = done / total * 100.0
-                self.root.after(0, self._update_progress, percent, done, speed, output.name)
+                speed = self.completed_frames / elapsed
+                percent = self.completed_frames / self.info.frame_count * 100.0 if self.info.frame_count else 0.0
+                self.root.after(0, self._update_progress, percent, speed, output.name, state)
             except Exception as exc:
                 self.root.after(0, self._worker_error, str(exc))
                 return
 
+        self.processing_frames = 0
+        self.root.after(0, self._update_live_counts)
         self.root.after(0, self._worker_done)
 
-    def _update_progress(self, percent, done, speed, filename):
-        self.progress_var.set(percent)
-        assert self.info is not None
+    def _update_live_counts(self):
         self.stats_var.set(
-            f"処理済みチャンク: {done:,} / {len(self.plan):,} | "
-            f"処理速度: {speed:.1f} frame/s | 最新: {filename}"
+            f"処理済み：{self.completed_frames:,} 枚  "
+            f"処理中：{self.processing_frames:,} 枚  "
+            f"処理待ち：{self.waiting_frames:,} 枚"
         )
-        self.status_var.set("チャンク展開中...")
+
+    def _update_progress(self, percent, speed, filename, state):
+        self.progress_var.set(percent)
+        self._update_live_counts()
+        self.status_var.set(f"処理中... | {speed:.1f} frame/s | {filename} | {state}")
 
     def _worker_done(self):
         stopped = self.session.stop_requested if self.session else False
