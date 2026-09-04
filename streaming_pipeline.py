@@ -13,6 +13,7 @@ from typing import Callable, Optional
 MAX_STREAMING_HEIGHT = 1080
 DEFAULT_QUEUE_FRAMES = 4
 QUEUE_TIMEOUT = 0.10
+PROCESS_WAIT_TIMEOUT = 60.0
 
 
 @dataclass
@@ -66,8 +67,18 @@ def _terminate_process(process: subprocess.Popen[bytes]) -> None:
         except Exception:
             try:
                 process.kill()
+                process.wait(timeout=2)
             except Exception:
                 pass
+
+
+def _wait_process(process: subprocess.Popen[bytes], timeout: float) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _terminate_process(process)
 
 
 def _queue_put(queue, item, stop: threading.Event) -> bool:
@@ -128,7 +139,7 @@ def run_streaming_pipeline(
         ["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "rawvideo",
          "-pix_fmt", "rgb24", "-s", f"{width}x{height}", "-r", f"{fps:.12g}",
          "-i", "pipe:0", "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p",
-         "-threads", str(max(1, threads)), "-y", str(output_path)],
+         "-threads", str(max(1, threads)), "-movflags", "+faststart", "-y", str(output_path)],
         stdin=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,
     )
 
@@ -214,12 +225,22 @@ def run_streaming_pipeline(
             if stop.is_set():
                 _terminate_process(decoder)
                 _terminate_process(encoder)
+                break
             for worker in workers:
                 worker.join(timeout=QUEUE_TIMEOUT)
+
+        if stop.is_set():
+            _terminate_process(decoder)
+            _terminate_process(encoder)
+        else:
+            # Normal success path: closing encoder.stdin only signals EOF.
+            # FFmpeg must be allowed to finish the MP4 trailer/moov atom.
+            _wait_process(decoder, PROCESS_WAIT_TIMEOUT)
+            _wait_process(encoder, PROCESS_WAIT_TIMEOUT)
     finally:
-        stop.set()
-        _terminate_process(decoder)
-        _terminate_process(encoder)
+        if stop.is_set():
+            _terminate_process(decoder)
+            _terminate_process(encoder)
         for worker in workers:
             worker.join(timeout=1)
         decoder_err = decoder.stderr.read().decode("utf-8", errors="replace") if decoder.stderr else ""
@@ -236,4 +257,6 @@ def run_streaming_pipeline(
         raise RuntimeError(f"FFmpeg encode failed:\n{encoder_err.strip()}")
     if frame_count and stats.frames != frame_count:
         raise RuntimeError(f"処理フレーム数が一致しません: {stats.frames}/{frame_count}")
+    if not output_path.exists() or output_path.stat().st_size <= 0:
+        raise RuntimeError("出力MP4が生成されませんでした。")
     return stats
