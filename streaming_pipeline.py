@@ -14,6 +14,7 @@ MAX_STREAMING_HEIGHT = 1080
 DEFAULT_QUEUE_FRAMES = 4
 QUEUE_TIMEOUT = 0.10
 PROCESS_WAIT_TIMEOUT = 60.0
+FORCE_KILL_TIMEOUT = 2.0
 
 
 @dataclass
@@ -39,8 +40,10 @@ def choose_queue_frames(width: int, height: int, ram_available: Optional[int]) -
     frame_bytes = max(1, width * height * 3)
     if ram_available is None:
         return DEFAULT_QUEUE_FRAMES
-    budget = max(frame_bytes, ram_available // 32)
-    return int(max(1, min(8, budget // frame_bytes)))
+    # Two bounded queues can hold frames simultaneously, so leave headroom for
+    # both queues plus the three worker-local frames/buffers.
+    budget = max(frame_bytes * 2, ram_available // 32)
+    return int(max(1, min(8, budget // (frame_bytes * 2))))
 
 
 def passthrough_processor(frame: bytes, index: int, width: int, height: int) -> bytes:
@@ -63,22 +66,23 @@ def _terminate_process(process: subprocess.Popen[bytes]) -> None:
     if process.poll() is None:
         try:
             process.terminate()
-            process.wait(timeout=2)
+            process.wait(timeout=FORCE_KILL_TIMEOUT)
         except Exception:
             try:
                 process.kill()
-                process.wait(timeout=2)
+                process.wait(timeout=FORCE_KILL_TIMEOUT)
             except Exception:
                 pass
 
 
-def _wait_process(process: subprocess.Popen[bytes], timeout: float) -> None:
+def _wait_process(process: subprocess.Popen[bytes], timeout: float) -> bool:
     if process.poll() is not None:
-        return
+        return True
     try:
         process.wait(timeout=timeout)
+        return True
     except subprocess.TimeoutExpired:
-        _terminate_process(process)
+        return False
 
 
 def _queue_put(queue, item, stop: threading.Event) -> bool:
@@ -128,6 +132,7 @@ def run_streaming_pipeline(
     stop = stop_event or threading.Event()
     stats = StreamingStats(started=time.perf_counter())
     errors: list[BaseException] = []
+    errors_lock = threading.Lock()
 
     decoder = subprocess.Popen(
         ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(input_path),
@@ -142,6 +147,10 @@ def run_streaming_pipeline(
          "-threads", str(max(1, threads)), "-movflags", "+faststart", "-y", str(output_path)],
         stdin=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,
     )
+
+    def add_error(exc: BaseException) -> None:
+        with errors_lock:
+            errors.append(exc)
 
     def decoder_worker() -> None:
         try:
@@ -159,7 +168,7 @@ def run_streaming_pipeline(
             _queue_put(raw_queue, None, stop)
         except BaseException as exc:
             if not stop.is_set():
-                errors.append(exc)
+                add_error(exc)
             stop.set()
             try:
                 raw_queue.put_nowait(None)
@@ -182,7 +191,7 @@ def run_streaming_pipeline(
                     return
         except BaseException as exc:
             if not stop.is_set():
-                errors.append(exc)
+                add_error(exc)
             stop.set()
             try:
                 encoded_queue.put_nowait(None)
@@ -209,7 +218,7 @@ def run_streaming_pipeline(
                     progress_callback(stats)
         except BaseException as exc:
             if not stop.is_set():
-                errors.append(exc)
+                add_error(exc)
             stop.set()
 
     workers = [
@@ -220,29 +229,35 @@ def run_streaming_pipeline(
     for worker in workers:
         worker.start()
 
+    interrupted = False
     try:
         while any(worker.is_alive() for worker in workers):
-            if stop.is_set():
-                _terminate_process(decoder)
-                _terminate_process(encoder)
-                break
             for worker in workers:
                 worker.join(timeout=QUEUE_TIMEOUT)
-
-        if stop.is_set():
+    except BaseException:
+        interrupted = True
+        stop.set()
+        raise
+    finally:
+        if interrupted or stop.is_set():
+            # Emergency/error path: no graceful trailer wait. Reap children now.
+            stop.set()
             _terminate_process(decoder)
             _terminate_process(encoder)
         else:
-            # Normal success path: closing encoder.stdin only signals EOF.
-            # FFmpeg must be allowed to finish the MP4 trailer/moov atom.
-            _wait_process(decoder, PROCESS_WAIT_TIMEOUT)
-            _wait_process(encoder, PROCESS_WAIT_TIMEOUT)
-    finally:
-        if stop.is_set():
-            _terminate_process(decoder)
-            _terminate_process(encoder)
+            # Normal path: worker closed encoder.stdin, so wait for FFmpeg to
+            # flush the final MP4 trailer/moov atom instead of terminating it.
+            decoder_done = _wait_process(decoder, PROCESS_WAIT_TIMEOUT)
+            encoder_done = _wait_process(encoder, PROCESS_WAIT_TIMEOUT)
+            if not decoder_done or not encoder_done:
+                add_error(RuntimeError("FFmpegが制限時間内に正常終了しませんでした。出力を成功扱いにしません。"))
+                stop.set()
+                _terminate_process(decoder)
+                _terminate_process(encoder)
+
         for worker in workers:
             worker.join(timeout=1)
+
         decoder_err = decoder.stderr.read().decode("utf-8", errors="replace") if decoder.stderr else ""
         encoder_err = encoder.stderr.read().decode("utf-8", errors="replace") if encoder.stderr else ""
         stats.finished = time.perf_counter()
