@@ -5,6 +5,7 @@ from __future__ import annotations
 import multiprocessing as mp
 import os
 import queue
+import signal
 import time
 from dataclasses import dataclass
 
@@ -19,6 +20,14 @@ class RangeStats:
 
 
 def _worker_loop(worker_id, task_queue, result_queue, width, height, settings):
+    # On Windows, Ctrl+C can be delivered to every process attached to the
+    # console. Workers must NOT handle SIGINT themselves; the parent owns the
+    # stop event and explicitly terminates workers during shutdown.
+    try:
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+    except (AttributeError, ValueError):
+        pass
+
     from sketch_renderer import make_processor
     processor = make_processor(settings)
     while True:
