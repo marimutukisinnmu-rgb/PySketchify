@@ -54,6 +54,23 @@ def passthrough_processor(frame: bytes, index: int, width: int, height: int) -> 
     return frame
 
 
+def _read_exact(stream, size: int) -> bytes:
+    """Read exactly one raw frame from a pipe.
+
+    ``file.read(size)`` is not guaranteed to return size bytes for a pipe;
+    a short read is normal. Accumulate until one complete frame arrives or EOF.
+    """
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining:
+        chunk = stream.read(remaining)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
 def _terminate_process(process: subprocess.Popen[bytes]) -> None:
     if process.poll() is None:
         try:
@@ -134,11 +151,13 @@ def run_streaming_pipeline(
             assert decoder.stdout is not None
             index = 0
             while not stop.is_set():
-                frame = decoder.stdout.read(frame_size)
+                frame = _read_exact(decoder.stdout, frame_size)
                 if not frame:
                     break
                 if len(frame) != frame_size:
-                    raise RuntimeError("FFmpegから不完全なフレームを受信しました。")
+                    raise RuntimeError(
+                        f"FFmpegから不完全なフレームを受信しました: {len(frame)}/{frame_size} bytes"
+                    )
                 raw_queue.put((index, frame))
                 index += 1
             raw_queue.put(None)
@@ -177,7 +196,6 @@ def run_streaming_pipeline(
             while not stop.is_set():
                 item = encoded_queue.get()
                 if item is None:
-                    # EOF is required for FFmpeg to finish the output container.
                     encoder.stdin.close()
                     return
                 index, frame = item
