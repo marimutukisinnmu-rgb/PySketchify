@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-"""Bounded FFmpeg streaming pipeline for internal pencil rendering."""
+"""Bounded FFmpeg streaming pipeline with adaptive range multiprocessing."""
 
 import subprocess
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from queue import Empty, Full, Queue
 from typing import Callable, Optional
 
 DEFAULT_QUEUE_FRAMES = 4
@@ -20,135 +19,154 @@ class StreamingStats:
     frames: int = 0
     started: float = 0.0
     finished: float = 0.0
+    workers: int = 1
     @property
-    def elapsed(self) -> float:
-        end=self.finished or time.perf_counter(); return max(0.000001,end-self.started)
+    def elapsed(self):
+        return max(.000001,(self.finished or time.perf_counter())-self.started)
     @property
-    def frame_rate(self) -> float: return self.frames/self.elapsed
+    def frame_rate(self): return self.frames/self.elapsed
 
 FrameProcessor=Callable[[bytes,int,int,int],bytes]
 
-def choose_queue_frames(width:int,height:int,ram_available:Optional[int])->int:
+def choose_queue_frames(width,height,ram_available):
     frame_bytes=max(1,width*height*3)
     if ram_available is None: return DEFAULT_QUEUE_FRAMES if frame_bytes<12_000_000 else 1
-    # Both queues contain complete RGB frames. Keep the budget conservative.
     budget=max(frame_bytes*2,ram_available//32)
     return int(max(1,min(8,budget//(frame_bytes*2))))
 
-def passthrough_processor(frame:bytes,index:int,width:int,height:int)->bytes: return frame
+def passthrough_processor(frame,index,width,height): return frame
 
-def _read_exact(stream,size:int)->bytes:
-    chunks=[]; remaining=size
+def _read_exact(stream,size):
+    parts=[]; remaining=size
     while remaining:
         chunk=stream.read(remaining)
         if not chunk: break
-        chunks.append(chunk); remaining-=len(chunk)
-    return b"".join(chunks)
+        parts.append(chunk); remaining-=len(chunk)
+    return b"".join(parts)
 
-def _terminate_process(process:subprocess.Popen[bytes])->None:
+def _terminate(process):
     if process.poll() is None:
         try: process.terminate(); process.wait(timeout=FORCE_KILL_TIMEOUT)
         except Exception:
             try: process.kill(); process.wait(timeout=FORCE_KILL_TIMEOUT)
             except Exception: pass
 
-def _wait_process(process:subprocess.Popen[bytes],timeout:float)->bool:
-    if process.poll() is not None: return True
-    try: process.wait(timeout=timeout); return True
-    except subprocess.TimeoutExpired: return False
-
-def _queue_put(queue,item,stop:threading.Event)->bool:
-    while not stop.is_set():
-        try: queue.put(item,timeout=QUEUE_TIMEOUT); return True
-        except Full: continue
-    return False
-
-def _queue_get(queue,stop:threading.Event):
-    while not stop.is_set():
-        try: return queue.get(timeout=QUEUE_TIMEOUT)
-        except Empty: continue
-    return None
+def _run_parallel_drawing(input_path,output_path,width,height,fps,frame_count,settings,ram_available,progress_callback,stop_event):
+    from parallel_pipeline import RangeParallelProcessor
+    frame_size=width*height*3
+    # Range size is adaptive: never force 1000 frames into RAM when frames are large.
+    budget=max(32*1024**2,min(256*1024**2,(ram_available or 512*1024**2)//8))
+    block_size=max(1,min(1000,budget//max(1,frame_size)))
+    worker_count=None
+    processor=RangeParallelProcessor(width,height,settings,worker_count,ram_available)
+    decoder=subprocess.Popen(["ffmpeg","-hide_banner","-loglevel","error","-i",str(input_path),"-map","0:v:0","-f","rawvideo","-pix_fmt","rgb24","-threads","1","pipe:1"],stdout=subprocess.PIPE,stderr=subprocess.PIPE,bufsize=0)
+    encoder=subprocess.Popen(["ffmpeg","-hide_banner","-loglevel","error","-f","rawvideo","-pix_fmt","rgb24","-s",f"{width}x{height}","-r",f"{fps:.12g}","-i","pipe:0","-an","-c:v","libx264","-pix_fmt","yuv420p","-threads","1","-movflags","+faststart","-y",str(output_path)],stdin=subprocess.PIPE,stderr=subprocess.PIPE,bufsize=0)
+    stats=StreamingStats(started=time.perf_counter(),workers=processor.worker_count)
+    def frames():
+        while not (stop_event and stop_event.is_set()):
+            frame=_read_exact(decoder.stdout,frame_size) if decoder.stdout else b""
+            if not frame: return
+            if len(frame)!=frame_size: raise RuntimeError(f"不完全なフレーム: {len(frame)}/{frame_size}")
+            yield frame
+    try:
+        processor.start(); assert encoder.stdin is not None
+        for frame in processor.process_stream(frames(),frame_count,block_size,progress_callback,stop_event):
+            if stop_event and stop_event.is_set(): break
+            encoder.stdin.write(frame)
+        if not (stop_event and stop_event.is_set()):
+            encoder.stdin.close()
+            if decoder.wait(timeout=PROCESS_WAIT_TIMEOUT)!=0: raise RuntimeError((decoder.stderr.read() if decoder.stderr else b"").decode(errors="replace"))
+            if encoder.wait(timeout=PROCESS_WAIT_TIMEOUT)!=0: raise RuntimeError((encoder.stderr.read() if encoder.stderr else b"").decode(errors="replace"))
+            if not output_path.exists() or output_path.stat().st_size<=0: raise RuntimeError("出力MP4が生成されませんでした。")
+            stats.frames=frame_count
+        stats.finished=time.perf_counter(); return stats
+    finally:
+        processor.stop(); _terminate(decoder); _terminate(encoder)
 
 def run_streaming_pipeline(input_path:Path,output_path:Path,width:int,height:int,fps:float,frame_count:int=0,
                            processor:FrameProcessor=passthrough_processor,queue_frames:Optional[int]=None,
-                           threads:int=1,progress_callback:Optional[Callable[[StreamingStats],None]]=None,
-                           stop_event:Optional[threading.Event]=None)->StreamingStats:
+                           threads:int=1,progress_callback=None,stop_event=None):
     if width<=0 or height<=0: raise ValueError("ストリーミングには正しい解像度が必要です。")
     if fps<=0: raise ValueError("ストリーミングには正しいFPSが必要です。")
     output_path.parent.mkdir(parents=True,exist_ok=True)
-    frame_size=width*height*3; qsize=max(1,queue_frames or DEFAULT_QUEUE_FRAMES)
-    raw_queue:Queue[Optional[tuple[int,bytes]]]=Queue(maxsize=qsize); encoded_queue:Queue[Optional[tuple[int,bytes]]]=Queue(maxsize=qsize)
-    stop=stop_event or threading.Event(); stats=StreamingStats(started=time.perf_counter()); errors=[]; errors_lock=threading.Lock()
+    # PencilSettings is attached by sketch_renderer.make_processor. Use the
+    # multiprocessing range path only for the actual drawing renderer.
+    settings=getattr(processor,"pencil_settings",None)
+    if settings is not None:
+        try:
+            import psutil
+            ram_available=int(psutil.virtual_memory().available)
+        except Exception:
+            ram_available=None
+        def cb(stats):
+            if progress_callback:
+                progress_callback(stats)
+        return _run_parallel_drawing(input_path,output_path,width,height,fps,frame_count,settings,ram_available,cb,stop_event)
+
+    frame_size=width*height*3; qsize=max(1,queue_frames or DEFAULT_QUEUE_FRAMES); stop=stop_event or threading.Event()
+    raw_queue=[]
+    from queue import Queue,Empty,Full
+    raw_queue=Queue(maxsize=qsize); encoded_queue=Queue(maxsize=qsize)
+    errors=[]; errors_lock=threading.Lock(); stats=StreamingStats(started=time.perf_counter())
     decoder=subprocess.Popen(["ffmpeg","-hide_banner","-loglevel","error","-i",str(input_path),"-map","0:v:0","-f","rawvideo","-pix_fmt","rgb24","-threads",str(max(1,threads)),"pipe:1"],stdout=subprocess.PIPE,stderr=subprocess.PIPE,bufsize=0)
     encoder=subprocess.Popen(["ffmpeg","-hide_banner","-loglevel","error","-f","rawvideo","-pix_fmt","rgb24","-s",f"{width}x{height}","-r",f"{fps:.12g}","-i","pipe:0","-an","-c:v","libx264","-pix_fmt","yuv420p","-threads",str(max(1,threads)),"-movflags","+faststart","-y",str(output_path)],stdin=subprocess.PIPE,stderr=subprocess.PIPE,bufsize=0)
-    def add_error(exc):
-        with errors_lock: errors.append(exc)
-    def decoder_worker():
+    def put(q,item):
+        while not stop.is_set():
+            try:q.put(item,timeout=QUEUE_TIMEOUT);return True
+            except Full:pass
+        return False
+    def get(q):
+        while not stop.is_set():
+            try:return q.get(timeout=QUEUE_TIMEOUT)
+            except Empty:pass
+        return None
+    def dec():
         try:
-            assert decoder.stdout is not None; index=0
+            i=0
             while not stop.is_set():
-                frame=_read_exact(decoder.stdout,frame_size)
-                if not frame: break
-                if len(frame)!=frame_size: raise RuntimeError(f"FFmpegから不完全なフレームを受信しました: {len(frame)}/{frame_size} bytes")
-                if not _queue_put(raw_queue,(index,frame),stop): return
-                index+=1
-            _queue_put(raw_queue,None,stop)
-        except BaseException as exc:
-            if not stop.is_set(): add_error(exc)
-            stop.set()
-            try: raw_queue.put_nowait(None)
-            except Exception: pass
-    def processor_worker():
+                f=_read_exact(decoder.stdout,frame_size)
+                if not f:break
+                if len(f)!=frame_size:raise RuntimeError("FFmpegから不完全なフレームを受信しました")
+                if not put(raw_queue,(i,f)):return
+                i+=1
+            put(raw_queue,None)
+        except BaseException as e:
+            errors.append(e);stop.set()
+    def proc():
         try:
             while not stop.is_set():
-                item=_queue_get(raw_queue,stop)
+                item=get(raw_queue)
                 if item is None:
-                    if not stop.is_set(): _queue_put(encoded_queue,None,stop)
+                    if not stop.is_set():put(encoded_queue,None)
                     return
-                index,frame=item; processed=processor(frame,index,width,height)
-                if len(processed)!=frame_size: raise RuntimeError("フレーム処理結果のサイズが元フレームと一致しません。")
-                if not _queue_put(encoded_queue,(index,processed),stop): return
-        except BaseException as exc:
-            if not stop.is_set(): add_error(exc)
-            stop.set()
-            try: encoded_queue.put_nowait(None)
-            except Exception: pass
-    def encoder_worker():
+                i,f=item; out=processor(f,i,width,height)
+                if len(out)!=frame_size:raise RuntimeError("フレーム処理結果のサイズが元フレームと一致しません")
+                if not put(encoded_queue,(i,out)):return
+        except BaseException as e:errors.append(e);stop.set()
+    def enc():
         try:
-            assert encoder.stdin is not None; expected=0
+            expected=0
             while not stop.is_set():
-                item=_queue_get(encoded_queue,stop)
+                item=get(encoded_queue)
                 if item is None:
-                    if not stop.is_set(): encoder.stdin.close()
+                    if not stop.is_set():encoder.stdin.close()
                     return
-                index,frame=item
-                if index!=expected: raise RuntimeError(f"フレーム順序が壊れました: expected={expected}, got={index}")
-                encoder.stdin.write(frame); expected+=1; stats.frames=expected
-                if progress_callback: progress_callback(stats)
-        except BaseException as exc:
-            if not stop.is_set(): add_error(exc)
-            stop.set()
-    workers=[threading.Thread(target=decoder_worker,name="PySketchify-Decode",daemon=True),threading.Thread(target=processor_worker,name="PySketchify-Process",daemon=True),threading.Thread(target=encoder_worker,name="PySketchify-Encode",daemon=True)]
-    for worker in workers: worker.start()
-    interrupted=False
+                i,f=item
+                if i!=expected:raise RuntimeError(f"フレーム順序が壊れました: expected={expected}, got={i}")
+                encoder.stdin.write(f);expected+=1;stats.frames=expected
+                if progress_callback:progress_callback(stats)
+        except BaseException as e:errors.append(e);stop.set()
+    workers=[threading.Thread(target=dec),threading.Thread(target=proc),threading.Thread(target=enc)]
+    for w in workers:w.start()
     try:
-        while any(worker.is_alive() for worker in workers):
-            for worker in workers: worker.join(timeout=QUEUE_TIMEOUT)
-    except BaseException:
-        interrupted=True; stop.set(); raise
+        for w in workers:w.join()
+        if stop_event and stop_event.is_set():return stats
+        if decoder.wait(timeout=PROCESS_WAIT_TIMEOUT)!=0:raise RuntimeError("FFmpeg decode failed")
+        if encoder.wait(timeout=PROCESS_WAIT_TIMEOUT)!=0:raise RuntimeError("FFmpeg encode failed")
     finally:
-        if interrupted or stop.is_set():
-            stop.set(); _terminate_process(decoder); _terminate_process(encoder)
-        else:
-            decoder_done=_wait_process(decoder,PROCESS_WAIT_TIMEOUT); encoder_done=_wait_process(encoder,PROCESS_WAIT_TIMEOUT)
-            if not decoder_done or not encoder_done:
-                add_error(RuntimeError("FFmpegが制限時間内に正常終了しませんでした。出力を成功扱いにしません。")); stop.set(); _terminate_process(decoder); _terminate_process(encoder)
-        for worker in workers: worker.join(timeout=1)
-        decoder_err=decoder.stderr.read().decode("utf-8",errors="replace") if decoder.stderr else ""; encoder_err=encoder.stderr.read().decode("utf-8",errors="replace") if encoder.stderr else ""; stats.finished=time.perf_counter()
-    if errors: raise RuntimeError(str(errors[0]))
-    if stop_event is not None and stop_event.is_set(): return stats
-    if decoder.returncode not in (0,None): raise RuntimeError(f"FFmpeg decode failed:\n{decoder_err.strip()}")
-    if encoder.returncode not in (0,None): raise RuntimeError(f"FFmpeg encode failed:\n{encoder_err.strip()}")
-    if frame_count and stats.frames!=frame_count: raise RuntimeError(f"処理フレーム数が一致しません: {stats.frames}/{frame_count}")
-    if not output_path.exists() or output_path.stat().st_size<=0: raise RuntimeError("出力MP4が生成されませんでした。")
+        _terminate(decoder);_terminate(encoder)
+    stats.finished=time.perf_counter()
+    if errors:raise RuntimeError(str(errors[0]))
+    if frame_count and stats.frames!=frame_count:raise RuntimeError(f"処理フレーム数が一致しません: {stats.frames}/{frame_count}")
+    if not output_path.exists() or output_path.stat().st_size<=0:raise RuntimeError("出力MP4が生成されませんでした")
     return stats
