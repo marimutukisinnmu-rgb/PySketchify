@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import multiprocessing as mp
 import os
-import subprocess
+import queue
 import time
 from dataclasses import dataclass
-from typing import Optional
 
 from parallel_workers import choose_worker_count
 
@@ -23,7 +22,10 @@ def _worker_loop(worker_id, task_queue, result_queue, width, height, settings):
     from sketch_renderer import make_processor
     processor = make_processor(settings)
     while True:
-        task = task_queue.get()
+        try:
+            task = task_queue.get()
+        except (EOFError, OSError):
+            return
         if task is None:
             return
         start, frames = task
@@ -34,11 +36,14 @@ def _worker_loop(worker_id, task_queue, result_queue, width, height, settings):
                 output.append((index, processor(frame, index, width, height)))
             result_queue.put((worker_id, start, start + len(frames) - 1, output, None))
         except BaseException as exc:
-            result_queue.put((worker_id, start, start + len(frames) - 1, None, repr(exc)))
+            try:
+                result_queue.put((worker_id, start, start + len(frames) - 1, None, repr(exc)))
+            except Exception:
+                pass
 
 
 class RangeParallelProcessor:
-    """Persistent processes; each submitted job is a contiguous frame range."""
+    """Persistent processes with bounded queues and explicit Ctrl+C-safe teardown."""
     def __init__(self, width, height, settings, worker_count=None, ram_available=None):
         frame_bytes = max(1, width * height * 3)
         self.worker_count = worker_count or choose_worker_count(os.cpu_count(), ram_available, frame_bytes)
@@ -48,19 +53,24 @@ class RangeParallelProcessor:
         self.task_queues = []
         self.result_queue = self.ctx.Queue(maxsize=self.worker_count * 2)
         self.processes = []
+        self._stopped = False
 
     def start(self):
+        self._stopped = False
         for worker_id in range(1, self.worker_count + 1):
             q = self.ctx.Queue(maxsize=1)
-            p = self.ctx.Process(target=_worker_loop,
-                                 args=(worker_id, q, self.result_queue, self.width, self.height, self.settings),
-                                 name=f"PySketchify-Draw-{worker_id}")
+            p = self.ctx.Process(
+                target=_worker_loop,
+                args=(worker_id, q, self.result_queue, self.width, self.height, self.settings),
+                name=f"PySketchify-Draw-{worker_id}",
+                daemon=True,
+            )
             p.start()
             self.task_queues.append(q)
             self.processes.append(p)
 
     def process_stream(self, frame_iter, total_frames, block_size, progress_callback=None, stop_event=None):
-        """Process contiguous ranges while keeping only one range per worker in RAM."""
+        """Process ranges while remaining responsive to stop requests and Ctrl+C."""
         iterator = iter(frame_iter)
         active = {}
         next_index = 0
@@ -80,7 +90,10 @@ class RangeParallelProcessor:
                     break
             if not frames:
                 return False
-            self.task_queues[worker_slot].put((start, frames))
+            try:
+                self.task_queues[worker_slot].put((start, frames), timeout=0.2)
+            except (queue.Full, EOFError, OSError):
+                return False
             active[worker_slot] = (start, len(frames))
             return True
 
@@ -92,7 +105,12 @@ class RangeParallelProcessor:
         while active:
             if stop_event is not None and stop_event.is_set():
                 break
-            worker_id, start, end, output, error = self.result_queue.get()
+            try:
+                worker_id, start, end, output, error = self.result_queue.get(timeout=0.2)
+            except queue.Empty:
+                if any(not p.is_alive() and p.exitcode not in (None, 0) for p in self.processes):
+                    raise RuntimeError("描画Workerが異常終了しました。")
+                continue
             slot = None
             for candidate, job in active.items():
                 if job[0] == start:
@@ -107,86 +125,63 @@ class RangeParallelProcessor:
             while next_emit in buffers:
                 ordered = buffers.pop(next_emit)
                 for _, frame in ordered:
+                    if stop_event is not None and stop_event.is_set():
+                        break
                     yield frame
                     completed += 1
                     if progress_callback:
                         elapsed = max(0.001, time.perf_counter() - started)
                         progress_callback(RangeStats(completed, completed / elapsed, self.worker_count))
+                if stop_event is not None and stop_event.is_set():
+                    break
                 next_emit += len(ordered)
             if not (stop_event is not None and stop_event.is_set()):
                 if submit(slot, next_index):
                     next_index += active[slot][1]
 
     def stop(self):
+        """Explicitly tear down queues/processes so multiprocessing atexit cannot hang."""
+        if self._stopped:
+            return
+        self._stopped = True
+
+        # Do not let multiprocessing's atexit handler wait for queue feeder threads.
+        for q in self.task_queues + [self.result_queue]:
+            try:
+                q.cancel_join_thread()
+            except Exception:
+                pass
+
         for q in self.task_queues:
             try:
                 q.put_nowait(None)
             except Exception:
                 pass
+
         for p in self.processes:
-            p.join(timeout=2)
+            try:
+                p.join(timeout=0.5)
+            except (KeyboardInterrupt, OSError):
+                pass
+
+        for p in self.processes:
             if p.is_alive():
-                p.terminate()
-                p.join(timeout=1)
+                try:
+                    p.terminate()
+                except Exception:
+                    pass
+
+        for p in self.processes:
+            try:
+                p.join(timeout=0.5)
+            except (KeyboardInterrupt, OSError):
+                pass
+
+        for q in self.task_queues + [self.result_queue]:
+            try:
+                q.close()
+            except Exception:
+                pass
+
         self.task_queues.clear()
         self.processes.clear()
-
-
-def run_parallel_video(input_path, output_path, width, height, fps, frame_count, settings,
-                       worker_count=None, ram_available=None, block_size=None,
-                       progress_callback=None, stop_event=None):
-    """Decode once, draw in contiguous multiprocessing ranges, encode in order."""
-    frame_size = width * height * 3
-    if block_size is None:
-        # Aim for <= ~256 MiB per worker's input range, capped at 1000 frames.
-        budget = 256 * 1024**2
-        block_size = max(1, min(1000, budget // max(frame_size, 1)))
-    processor = RangeParallelProcessor(width, height, settings, worker_count, ram_available)
-    decoder = subprocess.Popen(
-        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(input_path),
-         "-map", "0:v:0", "-f", "rawvideo", "-pix_fmt", "rgb24", "-threads", "1", "pipe:1"],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
-    encoder = subprocess.Popen(
-        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24",
-         "-s", f"{width}x{height}", "-r", f"{fps:.12g}", "-i", "pipe:0", "-an", "-c:v", "libx264",
-         "-pix_fmt", "yuv420p", "-threads", "1", "-movflags", "+faststart", "-y", str(output_path)],
-        stdin=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
-    processor.start()
-    started = time.perf_counter()
-
-    def frames():
-        while True:
-            data = decoder.stdout.read(frame_size) if decoder.stdout else b""
-            if not data:
-                return
-            if len(data) != frame_size:
-                raise RuntimeError(f"不完全なフレーム: {len(data)}/{frame_size}")
-            yield data
-
-    try:
-        assert encoder.stdin is not None
-        for frame in processor.process_stream(frames(), frame_count, block_size, progress_callback, stop_event):
-            if stop_event is not None and stop_event.is_set():
-                break
-            encoder.stdin.write(frame)
-        if stop_event is None or not stop_event.is_set():
-            encoder.stdin.close()
-            if decoder.wait(timeout=30) != 0:
-                raise RuntimeError((decoder.stderr.read() if decoder.stderr else b"").decode(errors="replace"))
-            if encoder.wait(timeout=60) != 0:
-                raise RuntimeError((encoder.stderr.read() if encoder.stderr else b"").decode(errors="replace"))
-            if frame_count and not progress_callback:
-                pass
-            if not output_path.exists() or output_path.stat().st_size <= 0:
-                raise RuntimeError("出力MP4が生成されませんでした。")
-    finally:
-        processor.stop()
-        if stop_event is not None and stop_event.is_set():
-            try: encoder.stdin.close()
-            except Exception: pass
-        for p in (decoder, encoder):
-            if p.poll() is None:
-                p.terminate()
-                try: p.wait(timeout=2)
-                except subprocess.TimeoutExpired: p.kill()
-    return RangeStats(frames=frame_count, frame_rate=frame_count / max(0.001, time.perf_counter() - started), workers=processor.worker_count)
