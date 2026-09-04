@@ -22,10 +22,11 @@ except ImportError:
 
 
 APP_NAME = "PySketchify"
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 DEFAULT_MARGIN_GB = 0.9
 DEFAULT_CHUNK_TARGET_GB = 2.0
 DEFAULT_COMPRESSION_RATIO = 0.40
+DEFAULT_OUTPUT_SUFFIX = "_pysketchify"
 SUPPORTED_INPUT_EXTENSIONS = {
     ".mp4", ".webm", ".mov", ".wmv", ".avi", ".mkv", ".mts", ".m2ts", ".avchd"
 }
@@ -64,6 +65,37 @@ class ResourceSnapshot:
     vram_shared_total: Optional[int]
     vram_shared_used: Optional[int]
     gpu_names: tuple[str, ...] = ()
+
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+
+
+def default_temp_dir() -> Path:
+    """Default temporary directory: the directory containing this .py / tmp."""
+    return Path(__file__).resolve().parent / "tmp"
+
+
+def default_output_path(input_path: Path) -> Path:
+    return input_path.with_name(input_path.stem + DEFAULT_OUTPUT_SUFFIX + ".mp4")
+
+
+def validate_input_path(path: Path) -> None:
+    if not path.exists():
+        raise FileNotFoundError(f"入力ファイルがありません: {path}")
+    if not path.is_file():
+        raise ValueError(f"入力先がファイルではありません: {path}")
+
+
+def cleanup_default_temp(temp_dir: Path, was_default: bool) -> None:
+    """Only remove our automatic ./tmp directory; never delete a user folder."""
+    if not was_default or not temp_dir.exists():
+        return
+    try:
+        shutil.rmtree(temp_dir)
+    except OSError:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +145,7 @@ def _ratio_to_float(value: str) -> float:
 
 
 def probe_video(path: Path) -> VideoInfo:
+    validate_input_path(path)
     _, ffprobe = require_ffmpeg()
     result = run_command(
         [
@@ -321,11 +354,23 @@ def build_chunk_plan(info: VideoInfo, target_gb: float = DEFAULT_CHUNK_TARGET_GB
     return plan
 
 
-def save_manifest(work_dir: Path, info: VideoInfo, plan: list[ChunkPlan], required_bytes: int) -> Path:
+def save_manifest(
+    work_dir: Path,
+    info: VideoInfo,
+    plan: list[ChunkPlan],
+    required_bytes: int,
+    output_path: Path,
+    temp_dir: Path,
+    temp_is_default: bool,
+) -> Path:
     manifest = {
         "app": APP_NAME,
         "version": VERSION,
         "video": asdict(info),
+        "input_path": str(info.path),
+        "temporary_directory": str(temp_dir),
+        "temporary_directory_is_default": temp_is_default,
+        "output_path": str(output_path),
         "estimated_required_bytes": required_bytes,
         "safety_margin_gb": DEFAULT_MARGIN_GB,
         "chunks": [asdict(chunk) for chunk in plan],
@@ -375,9 +420,17 @@ def extract_chunk(input_path: Path, output_path: Path, start_frame: int, end_fra
 
 
 class ProcessingSession:
-    def __init__(self, input_path: Path, work_root: Optional[Path] = None):
+    def __init__(
+        self,
+        input_path: Path,
+        temp_dir: Optional[Path] = None,
+        output_path: Optional[Path] = None,
+    ):
         self.input_path = input_path
-        self.work_root = work_root or (input_path.parent / f"{input_path.stem}_pysketchify_work")
+        self.temp_is_default = temp_dir is None or Path(temp_dir).resolve() == default_temp_dir().resolve()
+        self.temp_dir = Path(temp_dir).expanduser().resolve() if temp_dir else default_temp_dir()
+        self.output_path = Path(output_path).expanduser().resolve() if output_path else default_output_path(input_path)
+        self.work_root = self.temp_dir / f"{input_path.stem}_pysketchify"
         self.source_dir = self.work_root / "source_chunks"
         self.processed_dir = self.work_root / "processed_chunks"
         self.work_root.mkdir(parents=True, exist_ok=True)
@@ -392,7 +445,15 @@ class ProcessingSession:
         info = probe_video(self.input_path)
         plan = build_chunk_plan(info)
         required = add_safety_margin(sum(chunk.estimated_bytes for chunk in plan))
-        save_manifest(self.work_root, info, plan, required)
+        save_manifest(
+            self.work_root,
+            info,
+            plan,
+            required,
+            self.output_path,
+            self.temp_dir,
+            self.temp_is_default,
+        )
         return info, plan, required
 
     def run_extraction(self, info: VideoInfo, plan: list[ChunkPlan], progress_callback=None):
@@ -411,6 +472,12 @@ class ProcessingSession:
             if progress_callback:
                 progress_callback(chunk, output, "created", completed, info.frame_count)
 
+    def finish_cleanup(self) -> None:
+        # Default ./tmp is application-owned. Custom temporary folders are never
+        # removed automatically because they may contain user data.
+        if self.temp_is_default:
+            cleanup_default_temp(self.temp_dir, True)
+
 
 # ---------------------------------------------------------------------------
 # Console mode
@@ -418,9 +485,9 @@ class ProcessingSession:
 
 
 def print_video_info(info: VideoInfo):
-    print("=" * 68)
+    print("=" * 72)
     print(f"{APP_NAME} {VERSION}")
-    print("=" * 68)
+    print("=" * 72)
     print(f"入力       : {info.path}")
     print(f"解像度     : {info.width} × {info.height}")
     print(f"入力FPS    : {info.fps:.6g} FPS")
@@ -430,11 +497,11 @@ def print_video_info(info: VideoInfo):
     print(f"pixel fmt  : {info.pix_fmt}")
     print(f"音声       : {info.audio_streams} track")
     print(f"字幕       : {info.subtitle_streams} track")
-    print("=" * 68)
+    print("=" * 72)
 
 
-def console_run(path: Path):
-    session = ProcessingSession(path)
+def console_run(path: Path, temp_dir: Optional[Path] = None, output_path: Optional[Path] = None):
+    session = ProcessingSession(path, temp_dir=temp_dir, output_path=output_path)
     info, plan, required = session.prepare()
     print_video_info(info)
 
@@ -446,14 +513,16 @@ def console_run(path: Path):
         print(f"専用VRAM   : {format_bytes(resources.vram_dedicated_total)}")
 
     estimated = sum(c.estimated_bytes for c in plan)
+    print(f"一時ファイル先       : {session.temp_dir}")
+    print(f"出力先               : {session.output_path}")
     print(f"チャンク数           : {len(plan):,}")
     print(f"推定チャンク容量     : {format_bytes(estimated)}")
     print(f"安全余裕             : +{DEFAULT_MARGIN_GB:.1f} GB")
     print(f"推定必要容量         : {format_bytes(required)}")
-    print(f"作業フォルダ         : {session.work_root}")
 
-    free = shutil.disk_usage(session.work_root).free
-    print(f"現在の空き容量       : {format_bytes(free)}")
+    session.temp_dir.mkdir(parents=True, exist_ok=True)
+    free = shutil.disk_usage(session.temp_dir).free
+    print(f"一時ファイル先空き容量: {format_bytes(free)}")
     if free < required:
         raise RuntimeError(
             f"ディスク容量不足です。必要推定 {format_bytes(required)} / 空き {format_bytes(free)}"
@@ -473,8 +542,11 @@ def console_run(path: Path):
             f"{done_frames:,}/{total_frames:,} frame | {speed:.1f} frame/s | {state}"
         )
 
-    session.run_extraction(info, plan, progress)
-    print(f"完了: {completed_frames:,}/{info.frame_count:,} frame")
+    try:
+        session.run_extraction(info, plan, progress)
+        print(f"完了: {completed_frames:,}/{info.frame_count:,} frame")
+    finally:
+        session.finish_cleanup()
 
 
 # ---------------------------------------------------------------------------
@@ -486,21 +558,33 @@ class PySketchifyApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title(f"{APP_NAME} {VERSION}")
-        self.root.geometry("980x700")
+        self.root.geometry("1060x760")
         self.session: Optional[ProcessingSession] = None
         self.info: Optional[VideoInfo] = None
         self.plan: list[ChunkPlan] = []
         self.completed_frames = 0
         self.processing_frames = 0
         self.waiting_frames = 0
+        self._temp_is_default = True
 
-        self.path_var = tk.StringVar(value="")
-        self.status_var = tk.StringVar(value="動画を選択してください。")
+        self.input_var = tk.StringVar(value="")
+        self.temp_var = tk.StringVar(value=str(default_temp_dir()))
+        self.output_var = tk.StringVar(value="")
+        self.status_var = tk.StringVar(value="入力動画を選択してください。")
         self.progress_var = tk.DoubleVar(value=0.0)
-        self.stats_var = tk.StringVar(value="")
+        self.stats_var = tk.StringVar(value="処理済み：0 枚  処理中：0 枚  処理待ち：0 枚")
         self.resource_var = tk.StringVar(value="")
+        self.info_var = tk.StringVar(value="未選択")
 
         self._build()
+
+    def _path_row(self, parent, label, variable, browse_command, browse_text="参照"):
+        row = ttk.Frame(parent)
+        row.pack(fill="x", pady=4)
+        ttk.Label(row, text=label, width=22).pack(side="left")
+        ttk.Entry(row, textvariable=variable).pack(side="left", fill="x", expand=True)
+        ttk.Button(row, text=browse_text, command=browse_command).pack(side="left", padx=(8, 0))
+        return row
 
     def _build(self):
         root = self.root
@@ -508,24 +592,29 @@ class PySketchifyApp:
         main.pack(fill="both", expand=True)
 
         ttk.Label(main, text=APP_NAME, font=("Segoe UI", 20, "bold")).pack(anchor="w")
-        ttk.Label(main, text="動画 → 手描き風動画変換基盤", font=("Segoe UI", 10)).pack(anchor="w", pady=(0, 12))
+        ttk.Label(main, text="動画 → 手描き風動画変換", font=("Segoe UI", 10)).pack(anchor="w", pady=(0, 12))
 
-        select = ttk.Frame(main)
-        select.pack(fill="x")
-        ttk.Entry(select, textvariable=self.path_var).pack(side="left", fill="x", expand=True)
-        ttk.Button(select, text="動画を選択", command=self.choose_video).pack(side="left", padx=(8, 0))
+        paths = ttk.LabelFrame(main, text="入出力", padding=10)
+        paths.pack(fill="x")
+        self._path_row(paths, "入力先", self.input_var, self.choose_input, "動画を選択")
+        self._path_row(paths, "一時ファイル場所（任意）", self.temp_var, self.choose_temp, "変更")
+        ttk.Label(
+            paths,
+            text=f"入力なしの場合は (pyがある場所)/tmp。処理終了後、この自動生成tmpは削除します。",
+        ).pack(anchor="w", padx=(22, 0), pady=(0, 4))
+        self._path_row(paths, "出力先", self.output_var, self.choose_output, "保存先")
 
-        info_frame = ttk.LabelFrame(main, text="動画情報", padding=10)
+        info_frame = ttk.LabelFrame(main, text="動画情報 / リソース", padding=10)
         info_frame.pack(fill="x", pady=12)
-        self.info_label = ttk.Label(info_frame, text="未選択")
-        self.info_label.pack(anchor="w")
+        ttk.Label(info_frame, textvariable=self.info_var).pack(anchor="w")
         ttk.Label(info_frame, textvariable=self.resource_var).pack(anchor="w", pady=(6, 0))
 
-        self.canvas_frame = ttk.LabelFrame(main, text="処理中 / プレビュー", padding=10)
-        self.canvas_frame.pack(fill="both", expand=True)
+        self.preview_frame = ttk.LabelFrame(main, text="処理中 / プレビュー", padding=10)
+        self.preview_frame.pack(fill="both", expand=True)
         ttk.Label(
-            self.canvas_frame,
-            text="最新X枚のフレームをペイントアプリ風に表示する領域。\n手描き処理エンジン接続時に実フレームを表示します。",
+            self.preview_frame,
+            text="ここに最新フレームをペイントアプリ風に表示します。\n"
+                 "現在はチャンク展開基盤を実行します。",
             anchor="center",
             justify="center",
         ).pack(fill="both", expand=True)
@@ -536,12 +625,12 @@ class PySketchifyApp:
 
         buttons = ttk.Frame(main)
         buttons.pack(fill="x")
-        self.start_button = ttk.Button(buttons, text="チャンク展開開始", command=self.start)
+        self.start_button = ttk.Button(buttons, text="処理開始", command=self.start)
         self.start_button.pack(side="left")
         self.stop_button = ttk.Button(buttons, text="停止", command=self.stop, state="disabled")
         self.stop_button.pack(side="left", padx=8)
 
-    def choose_video(self):
+    def choose_input(self):
         path = filedialog.askopenfilename(
             title="入力動画を選択",
             filetypes=[
@@ -551,37 +640,59 @@ class PySketchifyApp:
         )
         if not path:
             return
+        selected = Path(path).resolve()
+        self.input_var.set(str(selected))
+        self.output_var.set(str(default_output_path(selected)))
+        self.analyze_input()
 
-        selected = Path(path)
-        if selected.suffix.lower() not in SUPPORTED_INPUT_EXTENSIONS:
-            proceed = messagebox.askyesno(
-                APP_NAME,
-                "拡張子は標準対応一覧にありません。FFmpegで読み込める可能性があります。続行しますか？",
-            )
-            if not proceed:
-                return
+    def choose_temp(self):
+        path = filedialog.askdirectory(title="一時ファイル場所を選択")
+        if not path:
+            return
+        selected = Path(path).resolve()
+        self.temp_var.set(str(selected))
+        self._temp_is_default = selected == default_temp_dir().resolve()
+        self.status_var.set("一時ファイル場所を変更しました。")
 
-        self.path_var.set(str(selected))
+    def choose_output(self):
+        current = Path(self.output_var.get()) if self.output_var.get() else None
+        initialdir = str(current.parent) if current else str(Path.home())
+        path = filedialog.asksaveasfilename(
+            title="出力先を選択",
+            initialdir=initialdir,
+            initialfile=current.name if current else "output_pysketchify.mp4",
+            defaultextension=".mp4",
+            filetypes=[("MP4 video", "*.mp4"), ("All files", "*.*")],
+        )
+        if path:
+            self.output_var.set(str(Path(path).resolve()))
+
+    def analyze_input(self):
+        if not self.input_var.get():
+            return
+        selected = Path(self.input_var.get())
         try:
             self.info = probe_video(selected)
             self.plan = build_chunk_plan(self.info)
             estimated = sum(c.estimated_bytes for c in self.plan)
             required = add_safety_margin(estimated)
-            free = shutil.disk_usage(selected.parent).free
+            temp = Path(self.temp_var.get()) if self.temp_var.get() else default_temp_dir()
+            temp.mkdir(parents=True, exist_ok=True)
+            free = shutil.disk_usage(temp).free
             resources = get_resource_snapshot()
             gpu_text = ", ".join(resources.gpu_names) if resources.gpu_names else "検出情報なし"
             ram_text = format_bytes(resources.ram_available) if resources.ram_available is not None else "不明"
             vram_text = format_bytes(resources.vram_dedicated_total) if resources.vram_dedicated_total is not None else "不明"
-            self.info_label.config(
-                text=(
-                    f"{self.info.width} × {self.info.height} | "
-                    f"{self.info.fps:.6g} FPS | {self.info.frame_count:,} frame | "
-                    f"audio {self.info.audio_streams} | subtitle {self.info.subtitle_streams}\n"
-                    f"チャンク {len(self.plan):,} 個 | 推定必要容量 {format_bytes(required)} | "
-                    f"空き {format_bytes(free)}"
-                )
+            self.info_var.set(
+                f"{self.info.width} × {self.info.height} | {self.info.fps:.6g} FPS | "
+                f"{self.info.frame_count:,} frame | audio {self.info.audio_streams} | "
+                f"subtitle {self.info.subtitle_streams}\n"
+                f"チャンク {len(self.plan):,} 個 | 推定必要容量 {format_bytes(required)} | "
+                f"一時先空き {format_bytes(free)}"
             )
-            self.resource_var.set(f"GPU: {gpu_text} | RAM空き: {ram_text} | 専用VRAM総量: {vram_text}")
+            self.resource_var.set(
+                f"GPU: {gpu_text} | RAM空き: {ram_text} | 専用VRAM総量: {vram_text}"
+            )
             self.status_var.set("解析完了。")
         except Exception as exc:
             self.info = None
@@ -590,28 +701,37 @@ class PySketchifyApp:
             messagebox.showerror(APP_NAME, str(exc))
 
     def start(self):
-        if not self.path_var.get():
-            self.choose_video()
-            if not self.path_var.get():
+        if not self.input_var.get():
+            self.choose_input()
+            if not self.input_var.get():
                 return
         if not self.info:
-            self.choose_video()
+            self.analyze_input()
             if not self.info:
                 return
 
+        temp = Path(self.temp_var.get()).expanduser().resolve() if self.temp_var.get() else default_temp_dir()
+        output = Path(self.output_var.get()).expanduser().resolve() if self.output_var.get() else default_output_path(Path(self.input_var.get()))
+        temp_is_default = temp == default_temp_dir().resolve()
+        self._temp_is_default = temp_is_default
         required = add_safety_margin(sum(c.estimated_bytes for c in self.plan))
-        work_root = Path(self.path_var.get()).parent / f"{Path(self.path_var.get()).stem}_pysketchify_work"
-        free = shutil.disk_usage(work_root.parent).free
+        temp.mkdir(parents=True, exist_ok=True)
+        free = shutil.disk_usage(temp).free
         if free < required:
             messagebox.showwarning(
                 APP_NAME,
-                f"ディスク容量が不足しています。\n\n"
+                f"一時ファイル場所の容量が不足しています。\n\n"
                 f"推定必要容量: {format_bytes(required)}\n"
                 f"空き容量: {format_bytes(free)}",
             )
             return
 
-        self.session = ProcessingSession(Path(self.path_var.get()), work_root)
+        if output.exists():
+            overwrite = messagebox.askyesno(APP_NAME, f"出力ファイルが既にあります。上書きしますか？\n\n{output}")
+            if not overwrite:
+                return
+
+        self.session = ProcessingSession(Path(self.input_var.get()), temp_dir=temp, output_path=output)
         self.start_button.config(state="disabled")
         self.stop_button.config(state="normal")
         self.progress_var.set(0)
@@ -626,37 +746,44 @@ class PySketchifyApp:
         assert self.info is not None
         started = time.perf_counter()
 
-        for chunk in self.plan:
-            if self.session.stop_requested:
-                break
+        try:
+            for chunk in self.plan:
+                if self.session.stop_requested:
+                    break
 
-            output = self.session.source_dir / chunk.filename
-            try:
+                output = self.session.source_dir / chunk.filename
                 if output.exists() and output.stat().st_size > 0:
                     self.completed_frames += chunk.frame_count
                     self.processing_frames = 0
-                    self.waiting_frames = max(0, self.info.frame_count - self.completed_frames)
-                    state = "exists"
                 else:
                     self.processing_frames = chunk.frame_count
-                    self.waiting_frames = max(0, self.info.frame_count - self.completed_frames - self.processing_frames)
+                    self.waiting_frames = max(
+                        0,
+                        self.info.frame_count - self.completed_frames - self.processing_frames,
+                    )
                     self.root.after(0, self._update_live_counts)
                     extract_chunk(self.session.input_path, output, chunk.start_frame, chunk.end_frame)
                     self.completed_frames += chunk.frame_count
                     self.processing_frames = 0
-                    self.waiting_frames = max(0, self.info.frame_count - self.completed_frames)
-                    state = "created"
 
+                self.waiting_frames = max(0, self.info.frame_count - self.completed_frames)
                 elapsed = max(0.001, time.perf_counter() - started)
                 speed = self.completed_frames / elapsed
-                percent = self.completed_frames / self.info.frame_count * 100.0 if self.info.frame_count else 0.0
-                self.root.after(0, self._update_progress, percent, speed, output.name, state)
-            except Exception as exc:
-                self.root.after(0, self._worker_error, str(exc))
-                return
+                percent = (
+                    self.completed_frames / self.info.frame_count * 100.0
+                    if self.info.frame_count else 0.0
+                )
+                self.root.after(0, self._update_progress, percent, speed, output.name)
 
-        self.processing_frames = 0
-        self.root.after(0, self._update_live_counts)
+            self.processing_frames = 0
+            self.root.after(0, self._update_live_counts)
+        except Exception as exc:
+            self.root.after(0, self._worker_error, str(exc))
+            return
+        finally:
+            if self.session and self.session.temp_is_default and not self.session.stop_requested:
+                self.session.finish_cleanup()
+
         self.root.after(0, self._worker_done)
 
     def _update_live_counts(self):
@@ -666,14 +793,19 @@ class PySketchifyApp:
             f"処理待ち：{self.waiting_frames:,} 枚"
         )
 
-    def _update_progress(self, percent, speed, filename, state):
+    def _update_progress(self, percent, speed, filename):
         self.progress_var.set(percent)
         self._update_live_counts()
-        self.status_var.set(f"処理中... | {speed:.1f} frame/s | {filename} | {state}")
+        self.status_var.set(f"処理中... | {speed:.1f} frame/s | {filename}")
 
     def _worker_done(self):
         stopped = self.session.stop_requested if self.session else False
-        self.status_var.set("停止しました。" if stopped else "チャンク展開完了。")
+        if stopped:
+            self.status_var.set("停止しました。")
+        else:
+            self.status_var.set(
+                "チャンク展開完了。最終出力生成は手描き処理エンジン接続後に行います。"
+            )
         self.start_button.config(state="normal")
         self.stop_button.config(state="disabled")
 
@@ -692,15 +824,14 @@ class PySketchifyApp:
 def main():
     if len(sys.argv) > 1:
         input_path = Path(sys.argv[1]).expanduser().resolve()
-        if not input_path.exists():
-            print(f"ファイルがありません: {input_path}", file=sys.stderr)
-            raise SystemExit(2)
-        console_run(input_path)
+        temp_dir = Path(sys.argv[2]).expanduser().resolve() if len(sys.argv) > 2 else None
+        output_path = Path(sys.argv[3]).expanduser().resolve() if len(sys.argv) > 3 else None
+        console_run(input_path, temp_dir=temp_dir, output_path=output_path)
         return
 
     if tk is None:
         print("Tkinterが利用できません。動画ファイルを引数に指定してください。")
-        print("例: python PySketchify.py input.mkv")
+        print("例: python PySketchify.py input.mkv [temp_dir] [output.mp4]")
         return
 
     root = tk.Tk()
