@@ -20,14 +20,11 @@ class RangeStats:
 
 
 def _worker_loop(worker_id, task_queue, result_queue, width, height, settings):
-    # On Windows, Ctrl+C can be delivered to every process attached to the
-    # console. Workers must NOT handle SIGINT themselves; the parent owns the
-    # stop event and explicitly terminates workers during shutdown.
+    # Ctrl+C belongs to the parent. This also prevents seven child tracebacks on Windows.
     try:
         signal.signal(signal.SIGINT, signal.SIG_IGN)
     except (AttributeError, ValueError):
         pass
-
     from sketch_renderer import make_processor
     processor = make_processor(settings)
     while True:
@@ -55,6 +52,15 @@ class RangeParallelProcessor:
     """Persistent processes with bounded queues and explicit Ctrl+C-safe teardown."""
     def __init__(self, width, height, settings, worker_count=None, ram_available=None):
         frame_bytes = max(1, width * height * 3)
+        try:
+            from gpu_backend import detect_gpu
+            self.gpu_info = detect_gpu()
+        except Exception:
+            self.gpu_info = None
+        # GPU mode uses one renderer process so CUDA/DirectML contexts and VRAM
+        # are not multiplied by the CPU worker count.
+        if worker_count is None and self.gpu_info is not None and self.gpu_info.backend != "cpu":
+            worker_count = 1
         self.worker_count = worker_count or choose_worker_count(os.cpu_count(), ram_available, frame_bytes)
         self.worker_count = max(1, self.worker_count)
         self.width, self.height, self.settings = width, height, settings
@@ -66,6 +72,8 @@ class RangeParallelProcessor:
 
     def start(self):
         self._stopped = False
+        if self.gpu_info is not None:
+            print(f"[GPU] backend={self.gpu_info.backend} | device={self.gpu_info.name} | workers={self.worker_count}")
         for worker_id in range(1, self.worker_count + 1):
             q = self.ctx.Queue(maxsize=1)
             p = self.ctx.Process(
@@ -153,44 +161,36 @@ class RangeParallelProcessor:
         if self._stopped:
             return
         self._stopped = True
-
-        # Do not let multiprocessing's atexit handler wait for queue feeder threads.
         for q in self.task_queues + [self.result_queue]:
             try:
                 q.cancel_join_thread()
             except Exception:
                 pass
-
         for q in self.task_queues:
             try:
                 q.put_nowait(None)
             except Exception:
                 pass
-
         for p in self.processes:
             try:
                 p.join(timeout=0.5)
             except (KeyboardInterrupt, OSError):
                 pass
-
         for p in self.processes:
             if p.is_alive():
                 try:
                     p.terminate()
                 except Exception:
                     pass
-
         for p in self.processes:
             try:
                 p.join(timeout=0.5)
             except (KeyboardInterrupt, OSError):
                 pass
-
         for q in self.task_queues + [self.result_queue]:
             try:
                 q.close()
             except Exception:
                 pass
-
         self.task_queues.clear()
         self.processes.clear()
