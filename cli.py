@@ -6,10 +6,10 @@ import threading
 import time
 from pathlib import Path
 
-from console_log import info, ok, section, kv, error
+from console_log import info, ok, section, kv, error, warn
 
 APP_NAME = "PySketchify"
-VERSION = "0.5.0"
+VERSION = "0.5.1"
 DEFAULT_OUTPUT_SUFFIX = "_pysketchify"
 MAX_STREAMING_HEIGHT = 1080
 
@@ -105,6 +105,9 @@ def main() -> int:
             import PySketchify
             PySketchify.main()
             return 0
+        except KeyboardInterrupt:
+            warn("Ctrl+C により停止しました。")
+            return 130
         except Exception as exc:
             error(str(exc))
             return 1
@@ -125,6 +128,9 @@ def main() -> int:
     try:
         import PySketchify
         video_info = PySketchify.probe_video(input_path)
+    except KeyboardInterrupt:
+        warn("Ctrl+C により停止しました。")
+        return 130
     except Exception as exc:
         error(str(exc))
         return 1
@@ -136,8 +142,6 @@ def main() -> int:
     kv("音声", f"{video_info.audio_streams} track")
     kv("字幕", f"{video_info.subtitle_streams} track")
 
-    # 1080p以下は、元動画をチャンクごとに何度も読み直さず、
-    # FFmpegを1本だけ走らせる有界ストリーミング経路を使う。
     if video_info.height <= MAX_STREAMING_HEIGHT:
         try:
             output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -150,7 +154,7 @@ def main() -> int:
             ok(f"出力: {output_path}")
             return 0
         except KeyboardInterrupt:
-            info("Ctrl+C により停止しました。", level="WARN")
+            warn("Ctrl+C により停止しました。")
             return 130
         except Exception as exc:
             error(str(exc))
@@ -162,7 +166,7 @@ def main() -> int:
         ok("処理エンジンが終了しました")
         return 0
     except KeyboardInterrupt:
-        info("Ctrl+C により停止しました。", level="WARN")
+        warn("Ctrl+C により停止しました。")
         return 130
     except Exception as exc:
         error(str(exc))
