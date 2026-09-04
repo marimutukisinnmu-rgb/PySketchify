@@ -2,13 +2,12 @@ from __future__ import annotations
 
 """Bounded FFmpeg streaming pipeline used for low-resolution videos.
 
-The pipeline deliberately keeps only a small number of frames in RAM:
-FFmpeg decoder -> bounded queue -> processor -> bounded queue -> FFmpeg encoder.
-The processor hook is ready for the hand-drawing engine; the current default
-processor is lossless pass-through so the infrastructure can be tested safely.
+FFmpeg decoder -> bounded RAM queue -> processor -> bounded RAM queue -> encoder.
+The processor hook is ready for the hand-drawing engine. The default processor
+is lossless pass-through so the infrastructure can be tested before the effect
+engine is connected.
 """
 
-import os
 import subprocess
 import threading
 import time
@@ -42,11 +41,10 @@ FrameProcessor = Callable[[bytes, int, int, int], bytes]
 
 
 def choose_queue_frames(width: int, height: int, ram_available: Optional[int]) -> int:
-    """Choose a small bounded queue from current RAM, never an unbounded buffer."""
+    """Choose a small bounded queue from current RAM."""
     frame_bytes = max(1, width * height * 3)
     if ram_available is None:
         return DEFAULT_QUEUE_FRAMES
-    # Keep at most about 1/32 of currently available RAM for the two queues.
     budget = max(frame_bytes, ram_available // 32)
     count = max(1, min(8, budget // frame_bytes))
     return int(count)
@@ -81,10 +79,10 @@ def run_streaming_pipeline(
     progress_callback: Optional[Callable[[StreamingStats], None]] = None,
     stop_event: Optional[threading.Event] = None,
 ) -> StreamingStats:
-    """Stream raw RGB frames through a bounded two-stage pipeline.
+    """Stream frames with bounded memory usage.
 
-    No full video and no full frame list is held in RAM. Only the bounded
-    queues and one frame per worker are resident at a time.
+    No full video or full frame list is held in RAM. Queue capacity is bounded,
+    so a fast decoder cannot outrun a slower processing stage indefinitely.
     """
     if width <= 0 or height <= 0:
         raise ValueError("ストリーミングには正しい解像度が必要です。")
@@ -93,7 +91,6 @@ def run_streaming_pipeline(
     if height > MAX_STREAMING_HEIGHT:
         raise ValueError("1080pを超える動画はチャンク/タイル処理を使用してください。")
 
-    ffmpeg = "ffmpeg"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     frame_size = width * height * 3
     qsize = max(1, queue_frames or DEFAULT_QUEUE_FRAMES)
@@ -105,7 +102,7 @@ def run_streaming_pipeline(
 
     decoder = subprocess.Popen(
         [
-            ffmpeg, "-hide_banner", "-loglevel", "error",
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
             "-i", str(input_path),
             "-map", "0:v:0",
             "-f", "rawvideo", "-pix_fmt", "rgb24",
@@ -118,7 +115,7 @@ def run_streaming_pipeline(
 
     encoder = subprocess.Popen(
         [
-            ffmpeg, "-hide_banner", "-loglevel", "error",
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
             "-f", "rawvideo", "-pix_fmt", "rgb24",
             "-s", f"{width}x{height}",
             "-r", f"{fps:.12g}",
@@ -180,6 +177,8 @@ def run_streaming_pipeline(
             while not stop.is_set():
                 item = encoded_queue.get()
                 if item is None:
+                    # EOF is required for FFmpeg to finish the output container.
+                    encoder.stdin.close()
                     return
                 index, frame = item
                 if index != expected:
@@ -197,17 +196,17 @@ def run_streaming_pipeline(
             errors.append(exc)
             stop.set()
 
-    threads_list = [
+    workers = [
         threading.Thread(target=decoder_worker, name="PySketchify-Decode", daemon=True),
         threading.Thread(target=processor_worker, name="PySketchify-Process", daemon=True),
         threading.Thread(target=encoder_worker, name="PySketchify-Encode", daemon=True),
     ]
-    for thread in threads_list:
-        thread.start()
+    for worker in workers:
+        worker.start()
 
     try:
-        for thread in threads_list:
-            thread.join()
+        for worker in workers:
+            worker.join()
     finally:
         stop.set()
         _terminate_process(decoder)
