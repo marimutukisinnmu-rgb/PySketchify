@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""FFT-based repeated frequency split/recombine audio transform with per-band time offsets."""
+"""FFT-based repeated frequency split/recombine audio transform with configurable delay."""
 
 import os
 import subprocess
@@ -15,8 +15,7 @@ DEFAULT_CHANNELS = 2
 DEFAULT_CHUNK = 65536
 DEFAULT_BANDS = 256
 DEFAULT_REPEATS = 3
-MIN_BAND_DELAY_MS = -3.0
-MAX_BAND_DELAY_MS = 3.0
+DEFAULT_DELAY_MS = 1.93
 
 
 def _decode_audio(input_path: Path) -> bytes:
@@ -40,25 +39,14 @@ def _decode_audio(input_path: Path) -> bytes:
 def _split_recombine(
     signal: np.ndarray,
     repeats: int,
-    rng: np.random.Generator,
+    delay_ms: float,
 ) -> np.ndarray:
-    """
-    Split the signal into frequency bands, apply an independent random
-    -3..+3 ms time offset to each band as a frequency-domain phase shift,
-    recombine, and repeat the operation.
-    """
+    """Split into frequency bands and apply a sin(FFT-sum)*delay-ms shift repeatedly."""
     out = signal.astype(np.float32, copy=True)
     bands = max(2, DEFAULT_BANDS)
-    min_delay_seconds = MIN_BAND_DELAY_MS / 1000.0
-    max_delay_seconds = MAX_BAND_DELAY_MS / 1000.0
+    delay_scale_seconds = float(delay_ms) / 1000.0
 
     for _ in range(max(1, int(repeats))):
-        band_delays = rng.uniform(
-            min_delay_seconds,
-            max_delay_seconds,
-            size=bands,
-        ).astype(np.float64)
-
         result = np.empty_like(out)
         for start in range(0, len(out), DEFAULT_CHUNK):
             chunk = out[start:start + DEFAULT_CHUNK]
@@ -66,6 +54,9 @@ def _split_recombine(
                 continue
 
             spectrum = np.fft.rfft(chunk)
+            fft_sum = float(np.sum(np.abs(spectrum), dtype=np.float64))
+            delay_seconds = float(np.sin(fft_sum) * delay_scale_seconds)
+
             rebuilt = np.zeros(chunk.size, dtype=np.float64)
             edges = np.linspace(0, len(spectrum), bands + 1, dtype=np.int32)
             frequencies = np.fft.rfftfreq(chunk.size, d=1.0 / DEFAULT_SAMPLE_RATE)
@@ -74,18 +65,13 @@ def _split_recombine(
                 lo, hi = int(edges[band]), int(edges[band + 1])
                 if hi <= lo:
                     continue
-
                 isolated = np.zeros_like(spectrum)
                 isolated[lo:hi] = spectrum[lo:hi]
-
-                phase = np.exp(
-                    -2j * np.pi * frequencies[lo:hi] * band_delays[band]
-                )
+                phase = np.exp(-2j * np.pi * frequencies[lo:hi] * delay_seconds)
                 isolated[lo:hi] *= phase
                 rebuilt += np.fft.irfft(isolated, n=chunk.size).real
 
             result[start:start + len(chunk)] = rebuilt.astype(np.float32)
-
         out = result
 
     peak = float(np.max(np.abs(out))) if out.size else 0.0
@@ -94,7 +80,11 @@ def _split_recombine(
     return out
 
 
-def make_hz_audio(input_path: Path, repeats: int = DEFAULT_REPEATS) -> Path | None:
+def make_hz_audio(
+    input_path: Path,
+    repeats: int = DEFAULT_REPEATS,
+    delay_ms: float = DEFAULT_DELAY_MS,
+) -> Path | None:
     raw = _decode_audio(input_path)
     if not raw:
         return None
@@ -105,9 +95,8 @@ def make_hz_audio(input_path: Path, repeats: int = DEFAULT_REPEATS) -> Path | No
         return None
 
     samples = samples[:usable].reshape(-1, DEFAULT_CHANNELS)
-    rng = np.random.default_rng()
     processed = np.stack(
-        [_split_recombine(samples[:, ch], repeats, rng) for ch in range(DEFAULT_CHANNELS)],
+        [_split_recombine(samples[:, ch], repeats, delay_ms) for ch in range(DEFAULT_CHANNELS)],
         axis=1,
     )
 
