@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import subprocess
 import tempfile
+import time
 import wave
 from pathlib import Path
 
@@ -18,29 +19,7 @@ DEFAULT_REPEATS = 3
 DEFAULT_DELAY_MS = 1.93
 
 
-def _decode_audio(input_path: Path) -> bytes:
-    proc = subprocess.run(
-        [
-            "ffmpeg", "-hide_banner", "-loglevel", "error",
-            "-i", str(input_path), "-vn",
-            "-ac", str(DEFAULT_CHANNELS),
-            "-ar", str(DEFAULT_SAMPLE_RATE),
-            "-f", "f32le", "pipe:1",
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
-    if proc.returncode != 0:
-        raise RuntimeError("音声デコードに失敗しました: " + proc.stderr.decode(errors="replace"))
-    return proc.stdout
-
-
-def _split_recombine(
-    signal: np.ndarray,
-    repeats: int,
-    delay_ms: float,
-) -> np.ndarray:
+def _split_recombine(signal: np.ndarray, repeats: int, delay_ms: float) -> np.ndarray:
     """Split into frequency bands, phase-shift each band, recombine, and repeat."""
     out = signal.astype(np.float32, copy=True)
     bands = max(2, int(DEFAULT_BANDS))
@@ -54,13 +33,9 @@ def _split_recombine(
                 continue
 
             spectrum = np.fft.rfft(chunk)
-            # FFT sum -> sine -> GUI-configurable delay in milliseconds.
             fft_sum = float(np.sum(np.abs(spectrum), dtype=np.float64))
             delay_seconds = float(np.sin(fft_sum) * delay_scale_seconds)
 
-            # Apply the same phase shift independently to every frequency band,
-            # then do ONE inverse FFT.  The old implementation performed one
-            # inverse FFT per band (256x), which made both GUI and CLI appear hung.
             frequencies = np.fft.rfftfreq(chunk.size, d=1.0 / DEFAULT_SAMPLE_RATE)
             edges = np.linspace(0, len(spectrum), bands + 1, dtype=np.int32)
             shifted = np.zeros_like(spectrum)
@@ -69,15 +44,13 @@ def _split_recombine(
                 lo, hi = int(edges[band]), int(edges[band + 1])
                 if hi <= lo:
                     continue
-                band_slice = spectrum[lo:hi]
-                phase = np.exp(-2j * np.pi * frequencies[lo:hi] * delay_seconds)
-                shifted[lo:hi] = band_slice * phase
+                shifted[lo:hi] = spectrum[lo:hi] * np.exp(
+                    -2j * np.pi * frequencies[lo:hi] * delay_seconds
+                )
 
             result[start:start + len(chunk)] = np.fft.irfft(
-                shifted,
-                n=chunk.size,
+                shifted, n=chunk.size
             ).real.astype(np.float32)
-
         out = result
 
     peak = float(np.max(np.abs(out))) if out.size else 0.0
@@ -91,27 +64,80 @@ def make_hz_audio(
     repeats: int = DEFAULT_REPEATS,
     delay_ms: float = DEFAULT_DELAY_MS,
 ) -> Path | None:
-    raw = _decode_audio(input_path)
-    if not raw:
-        return None
-
-    samples = np.frombuffer(raw, dtype=np.float32)
-    usable = samples.size - (samples.size % DEFAULT_CHANNELS)
-    if usable <= 0:
-        return None
-
-    samples = samples[:usable].reshape(-1, DEFAULT_CHANNELS)
-    processed = np.stack(
-        [_split_recombine(samples[:, ch], repeats, delay_ms) for ch in range(DEFAULT_CHANNELS)],
-        axis=1,
+    """Create a temporary WAV while processing the source audio incrementally."""
+    proc = subprocess.Popen(
+        [
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-i", str(input_path), "-vn",
+            "-ac", str(DEFAULT_CHANNELS),
+            "-ar", str(DEFAULT_SAMPLE_RATE),
+            "-f", "f32le", "pipe:1",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=0,
     )
 
     fd, path = tempfile.mkstemp(prefix="pysketchify_hz_", suffix=".wav")
     os.close(fd)
-    with wave.open(path, "wb") as wav:
-        wav.setnchannels(DEFAULT_CHANNELS)
-        wav.setsampwidth(2)
-        wav.setframerate(DEFAULT_SAMPLE_RATE)
-        pcm = np.clip(processed, -1.0, 1.0)
-        wav.writeframes((pcm * 32767.0).astype(np.int16).tobytes())
-    return Path(path)
+    output_path = Path(path)
+    processed_frames = 0
+    last_report = time.perf_counter()
+
+    try:
+        with wave.open(str(output_path), "wb") as wav:
+            wav.setnchannels(DEFAULT_CHANNELS)
+            wav.setsampwidth(2)
+            wav.setframerate(DEFAULT_SAMPLE_RATE)
+
+            raw_chunk_bytes = DEFAULT_CHUNK * DEFAULT_CHANNELS * 4
+            assert proc.stdout is not None
+            while True:
+                raw = proc.stdout.read(raw_chunk_bytes)
+                if not raw:
+                    break
+                usable = len(raw) - (len(raw) % (DEFAULT_CHANNELS * 4))
+                if usable <= 0:
+                    continue
+
+                samples = np.frombuffer(raw[:usable], dtype=np.float32)
+                samples = samples.reshape(-1, DEFAULT_CHANNELS)
+                channels = []
+                for ch in range(DEFAULT_CHANNELS):
+                    channels.append(_split_recombine(samples[:, ch], repeats, delay_ms))
+                processed = np.stack(channels, axis=1)
+
+                pcm = np.clip(processed, -1.0, 1.0)
+                wav.writeframes((pcm * 32767.0).astype(np.int16).tobytes())
+                processed_frames += samples.shape[0]
+
+                now = time.perf_counter()
+                if now - last_report >= 1.0:
+                    print(
+                        f"[HZ] 音声合成中... {processed_frames / DEFAULT_SAMPLE_RATE:.1f} sec",
+                        flush=True,
+                    )
+                    last_report = now
+
+        returncode = proc.wait(timeout=60)
+        if returncode != 0:
+            stderr = proc.stderr.read() if proc.stderr else b""
+            raise RuntimeError(
+                "音声デコードに失敗しました: " + stderr.decode(errors="replace")
+            )
+        if processed_frames <= 0:
+            output_path.unlink(missing_ok=True)
+            return None
+        print(
+            f"[HZ] 音声合成完了: {processed_frames / DEFAULT_SAMPLE_RATE:.1f} sec",
+            flush=True,
+        )
+        return output_path
+    except Exception:
+        try:
+            proc.kill()
+            proc.wait(timeout=2)
+        except Exception:
+            pass
+        output_path.unlink(missing_ok=True)
+        raise
