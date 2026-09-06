@@ -73,7 +73,7 @@ def render_frame(frame,index,width,height,settings):
     source=Image.frombytes("RGB",(width,height),frame); scale=min(1.,settings.analysis_max_size/max(width,height)); aw=max(1,int(width*scale)); ah=max(1,int(height*scale)); analysis=source.resize((aw,ah),Image.Resampling.BILINEAR)
     gray=np.asarray(analysis.convert("L").filter(ImageFilter.GaussianBlur(radius=.45)),dtype=np.uint8); base=analysis.copy()
     if settings.color_strength<1.: base=Image.blend(Image.new("RGB",analysis.size,(255,255,255)),base,settings.color_strength)
-    canvas=base.convert("RGBA"); draw=ImageDraw.Draw(canvas,"RGBA"); sx,sy=width/aw,height/ah; line_width=max(1,int(settings.width/max(.5,scale)))
+    canvas=base.convert("RGBA").resize((width,height),Image.Resampling.BICUBIC); draw=ImageDraw.Draw(canvas,"RGBA"); sx,sy=width/aw,height/ah; line_width=max(1,int(settings.width/max(.5,scale)))
     for p1,p2,strength in _edge_strokes(gray,settings,sx,sy): _stroke(draw,[p1,p2],line_width,settings.pen_type,(25,25,25,strength))
     if settings.color_strength>.05:
         for (x,y),fill in _color_dabs(analysis,settings,sx,sy):
