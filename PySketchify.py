@@ -244,7 +244,17 @@ class PySketchifyApp:
         except Exception as exc: self.root.after(0,self._worker_error,str(exc))
         finally: self.session.finish_cleanup()
     def _update_live_counts(self): self.stats_var.set(f"処理済み：{self.completed_frames:,} 枚  処理中：{self.processing_frames:,} 枚  処理待ち：{self.waiting_frames:,} 枚")
-    def _update_stream_progress(self,percent,speed): self.progress_var.set(percent); self._update_live_counts(); self.status_var.set(f"内部自動お絵描き中... | {speed:.1f} frame/s")
+    def _update_stream_progress(self,percent,speed):
+        self.progress_var.set(percent)
+        self._update_live_counts()
+        eta_text = "ETA: --:--"
+        if speed > 0 and self.info is not None:
+            remaining = max(0, self.info.frame_count - self.completed_frames)
+            eta_seconds = remaining / speed
+            minutes, seconds = divmod(int(eta_seconds + 0.5), 60)
+            hours, minutes = divmod(minutes, 60)
+            eta_text = f"ETA: {hours:d}:{minutes:02d}:{seconds:02d}" if hours else f"ETA: {minutes:02d}:{seconds:02d}"
+        self.status_var.set(f"内部自動お絵描き中... | {speed:.1f} frame/s | {eta_text}")
     def _worker_done(self): self.status_var.set("完了: " + (str(self.session.output_path) if self.session else "")); self.start_button.config(state="normal"); self.stop_button.config(state="disabled")
     def _worker_error(self,message): self.status_var.set(f"エラー: {message}"); self.start_button.config(state="normal"); self.stop_button.config(state="disabled"); messagebox.showerror(APP_NAME,message)
     def stop(self):
