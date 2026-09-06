@@ -41,9 +41,9 @@ def _split_recombine(
     repeats: int,
     delay_ms: float,
 ) -> np.ndarray:
-    """Split into frequency bands and apply a sin(FFT-sum)*delay-ms shift repeatedly."""
+    """Split into frequency bands, phase-shift each band, recombine, and repeat."""
     out = signal.astype(np.float32, copy=True)
-    bands = max(2, DEFAULT_BANDS)
+    bands = max(2, int(DEFAULT_BANDS))
     delay_scale_seconds = float(delay_ms) / 1000.0
 
     for _ in range(max(1, int(repeats))):
@@ -54,24 +54,30 @@ def _split_recombine(
                 continue
 
             spectrum = np.fft.rfft(chunk)
+            # FFT sum -> sine -> GUI-configurable delay in milliseconds.
             fft_sum = float(np.sum(np.abs(spectrum), dtype=np.float64))
             delay_seconds = float(np.sin(fft_sum) * delay_scale_seconds)
 
-            rebuilt = np.zeros(chunk.size, dtype=np.float64)
-            edges = np.linspace(0, len(spectrum), bands + 1, dtype=np.int32)
+            # Apply the same phase shift independently to every frequency band,
+            # then do ONE inverse FFT.  The old implementation performed one
+            # inverse FFT per band (256x), which made both GUI and CLI appear hung.
             frequencies = np.fft.rfftfreq(chunk.size, d=1.0 / DEFAULT_SAMPLE_RATE)
+            edges = np.linspace(0, len(spectrum), bands + 1, dtype=np.int32)
+            shifted = np.zeros_like(spectrum)
 
             for band in range(bands):
                 lo, hi = int(edges[band]), int(edges[band + 1])
                 if hi <= lo:
                     continue
-                isolated = np.zeros_like(spectrum)
-                isolated[lo:hi] = spectrum[lo:hi]
+                band_slice = spectrum[lo:hi]
                 phase = np.exp(-2j * np.pi * frequencies[lo:hi] * delay_seconds)
-                isolated[lo:hi] *= phase
-                rebuilt += np.fft.irfft(isolated, n=chunk.size).real
+                shifted[lo:hi] = band_slice * phase
 
-            result[start:start + len(chunk)] = rebuilt.astype(np.float32)
+            result[start:start + len(chunk)] = np.fft.irfft(
+                shifted,
+                n=chunk.size,
+            ).real.astype(np.float32)
+
         out = result
 
     peak = float(np.max(np.abs(out))) if out.size else 0.0
