@@ -50,17 +50,22 @@ def _terminate(process):
             try: process.kill();process.wait(timeout=FORCE_KILL_TIMEOUT)
             except Exception: pass
 
-def _run_parallel_drawing(input_path,output_path,width,height,fps,frame_count,settings,ram_available,progress_callback,stop_event):
+def _run_parallel_drawing(input_path,output_path,width,height,fps,frame_count,settings,ram_available,progress_callback,stop_event,copy_audio=False):
     from parallel_pipeline import RangeParallelProcessor
     frame_size=width*height*3
     processor=RangeParallelProcessor(width,height,settings,ram_available=ram_available)
-    # Total in-flight raw+processed range memory is kept small even with many CPUs.
     total_budget=ram_available or 512*1024**2
     per_worker_budget=max(8*1024**2,min(64*1024**2,total_budget//max(1,processor.worker_count*4)))
     block_size=max(1,min(1000,per_worker_budget//max(1,frame_size)))
-    print(f"[DRAW] range workers={processor.worker_count} | range={block_size} frame | frame={frame_size/1024/1024:.2f} MiB")
+    print(f"[DRAW] range workers={processor.worker_count} | range={block_size} frame | frame={frame_size/1024/1024:.2f} MiB | audio_copy={'ON' if copy_audio else 'OFF'}")
     decoder=subprocess.Popen(["ffmpeg","-hide_banner","-loglevel","error","-i",str(input_path),"-map","0:v:0","-f","rawvideo","-pix_fmt","rgb24","-threads","1","pipe:1"],stdout=subprocess.PIPE,stderr=subprocess.PIPE,bufsize=0)
-    encoder=subprocess.Popen(["ffmpeg","-hide_banner","-loglevel","error","-f","rawvideo","-pix_fmt","rgb24","-s",f"{width}x{height}","-r",f"{fps:.12g}","-i","pipe:0","-an","-c:v","libx264","-pix_fmt","yuv420p","-threads","1","-movflags","+faststart","-y",str(output_path)],stdin=subprocess.PIPE,stderr=subprocess.PIPE,bufsize=0)
+    encoder_cmd=["ffmpeg","-hide_banner","-loglevel","error","-f","rawvideo","-pix_fmt","rgb24","-s",f"{width}x{height}","-r",f"{fps:.12g}","-i","pipe:0"]
+    if copy_audio:
+        encoder_cmd += ["-i",str(input_path),"-map","0:v:0","-map","1:a?","-c:a","copy"]
+    else:
+        encoder_cmd += ["-an"]
+    encoder_cmd += ["-c:v","libx264","-pix_fmt","yuv420p","-threads","1","-movflags","+faststart","-y",str(output_path)]
+    encoder=subprocess.Popen(encoder_cmd,stdin=subprocess.PIPE,stderr=subprocess.PIPE,bufsize=0)
     stats=StreamingStats(started=time.perf_counter(),workers=processor.worker_count)
     def frames():
         while not (stop_event and stop_event.is_set()):
@@ -85,7 +90,7 @@ def _run_parallel_drawing(input_path,output_path,width,height,fps,frame_count,se
 
 def run_streaming_pipeline(input_path:Path,output_path:Path,width:int,height:int,fps:float,frame_count:int=0,
                            processor:FrameProcessor=passthrough_processor,queue_frames:Optional[int]=None,
-                           threads:int=1,progress_callback=None,stop_event=None)->StreamingStats:
+                           threads:int=1,progress_callback=None,stop_event=None,copy_audio:bool=False)->StreamingStats:
     if width<=0 or height<=0:raise ValueError("ストリーミングには正しい解像度が必要です。")
     if fps<=0:raise ValueError("ストリーミングには正しいFPSが必要です。")
     output_path.parent.mkdir(parents=True,exist_ok=True)
@@ -95,13 +100,16 @@ def run_streaming_pipeline(input_path:Path,output_path:Path,width:int,height:int
             import psutil
             ram_available=int(psutil.virtual_memory().available)
         except Exception:ram_available=None
-        return _run_parallel_drawing(input_path,output_path,width,height,fps,frame_count,settings,ram_available,progress_callback,stop_event)
-    # Passthrough/utility mode retains the original bounded three-stage pipeline.
+        return _run_parallel_drawing(input_path,output_path,width,height,fps,frame_count,settings,ram_available,progress_callback,stop_event,copy_audio=copy_audio)
     frame_size=width*height*3;qsize=max(1,queue_frames or DEFAULT_QUEUE_FRAMES);stop=stop_event or threading.Event()
     from queue import Queue,Empty,Full
     raw_queue=Queue(maxsize=qsize);encoded_queue=Queue(maxsize=qsize);errors=[];stats=StreamingStats(started=time.perf_counter())
     decoder=subprocess.Popen(["ffmpeg","-hide_banner","-loglevel","error","-i",str(input_path),"-map","0:v:0","-f","rawvideo","-pix_fmt","rgb24","-threads",str(max(1,threads)),"pipe:1"],stdout=subprocess.PIPE,stderr=subprocess.PIPE,bufsize=0)
-    encoder=subprocess.Popen(["ffmpeg","-hide_banner","-loglevel","error","-f","rawvideo","-pix_fmt","rgb24","-s",f"{width}x{height}","-r",f"{fps:.12g}","-i","pipe:0","-an","-c:v","libx264","-pix_fmt","yuv420p","-threads",str(max(1,threads)),"-movflags","+faststart","-y",str(output_path)],stdin=subprocess.PIPE,stderr=subprocess.PIPE,bufsize=0)
+    encoder_cmd=["ffmpeg","-hide_banner","-loglevel","error","-f","rawvideo","-pix_fmt","rgb24","-s",f"{width}x{height}","-r",f"{fps:.12g}","-i","pipe:0"]
+    if copy_audio: encoder_cmd += ["-i",str(input_path),"-map","0:v:0","-map","1:a?","-c:a","copy"]
+    else: encoder_cmd += ["-an"]
+    encoder_cmd += ["-c:v","libx264","-pix_fmt","yuv420p","-threads",str(max(1,threads)),"-movflags","+faststart","-y",str(output_path)]
+    encoder=subprocess.Popen(encoder_cmd,stdin=subprocess.PIPE,stderr=subprocess.PIPE,bufsize=0)
     def put(q,item):
         while not stop.is_set():
             try:q.put(item,timeout=QUEUE_TIMEOUT);return True
@@ -153,7 +161,7 @@ def run_streaming_pipeline(input_path:Path,output_path:Path,width:int,height:int
         for w in workers:w.join()
         if stop_event and stop_event.is_set():return stats
         if decoder.wait(timeout=PROCESS_WAIT_TIMEOUT)!=0:raise RuntimeError("FFmpeg decode failed")
-        if encoder.wait(timeout=PROCESS_WAIT_TIMEOUT)!=0:raise RuntimeError("FFmpeg encode failed")
+        if encoder.wait(timeout=PROCESS_WAIT_TIMEOUT)!=0:raise RuntimeError((encoder.stderr.read() if encoder.stderr else b"").decode(errors="replace"))
     finally:_terminate(decoder);_terminate(encoder)
     stats.finished=time.perf_counter()
     if errors:raise RuntimeError(str(errors[0]))
