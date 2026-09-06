@@ -50,14 +50,14 @@ def _terminate(process):
             try: process.kill();process.wait(timeout=FORCE_KILL_TIMEOUT)
             except Exception: pass
 
-def _prepare_audio(input_path: Path, hz_mode: bool) -> tuple[Path | None, bool]:
+def _prepare_audio(input_path: Path, hz_mode: bool, delay_ms: float = 1.93) -> tuple[Path | None, bool]:
     if not hz_mode:
         return input_path, False
     from audio_hz import make_hz_audio
-    path = make_hz_audio(input_path)
+    path = make_hz_audio(input_path, delay_ms=delay_ms)
     return path, path is not None
 
-def _run_parallel_drawing(input_path,output_path,width,height,fps,frame_count,settings,ram_available,progress_callback,stop_event,copy_audio=False):
+def _run_parallel_drawing(input_path,output_path,width,height,fps,frame_count,settings,ram_available,progress_callback,stop_event,copy_audio=False,hz_delay_ms:float=1.93):
     from parallel_pipeline import RangeParallelProcessor
     frame_size=width*height*3
     processor=RangeParallelProcessor(width,height,settings,ram_available=ram_available)
@@ -66,10 +66,10 @@ def _run_parallel_drawing(input_path,output_path,width,height,fps,frame_count,se
     block_size=max(1,min(1000,per_worker_budget//max(1,frame_size)))
     audio_path=None
     generated_audio=False
-    print(f"[DRAW] range workers={processor.worker_count} | range={block_size} frame | frame={frame_size/1024/1024:.2f} MiB | hz_audio={'ON' if copy_audio else 'OFF'}")
+    print(f"[DRAW] range workers={processor.worker_count} | range={block_size} frame | frame={frame_size/1024/1024:.2f} MiB | hz_audio={'ON' if copy_audio else 'OFF'} | delay={hz_delay_ms:.2f} ms")
     decoder=subprocess.Popen(["ffmpeg","-hide_banner","-loglevel","error","-i",str(input_path),"-map","0:v:0","-f","rawvideo","-pix_fmt","rgb24","-threads","1","pipe:1"],stdout=subprocess.PIPE,stderr=subprocess.PIPE,bufsize=0)
     try:
-        audio_path, generated_audio = _prepare_audio(input_path, copy_audio)
+        audio_path, generated_audio = _prepare_audio(input_path, copy_audio, delay_ms=hz_delay_ms)
         encoder_cmd=["ffmpeg","-hide_banner","-loglevel","error","-f","rawvideo","-pix_fmt","rgb24","-s",f"{width}x{height}","-r",f"{fps:.12g}","-i","pipe:0"]
         if audio_path is not None:
             encoder_cmd += ["-i",str(audio_path),"-map","0:v:0","-map","1:a?","-c:a","aac","-b:a","192k"] if generated_audio else ["-i",str(audio_path),"-map","0:v:0","-map","1:a?","-c:a","copy"]
@@ -106,7 +106,7 @@ def _run_parallel_drawing(input_path,output_path,width,height,fps,frame_count,se
 
 def run_streaming_pipeline(input_path:Path,output_path:Path,width:int,height:int,fps:float,frame_count:int=0,
                            processor:FrameProcessor=passthrough_processor,queue_frames:Optional[int]=None,
-                           threads:int=1,progress_callback=None,stop_event=None,copy_audio:bool=False)->StreamingStats:
+                           threads:int=1,progress_callback=None,stop_event=None,copy_audio:bool=False,hz_delay_ms:float=1.93)->StreamingStats:
     if width<=0 or height<=0:raise ValueError("ストリーミングには正しい解像度が必要です。")
     if fps<=0:raise ValueError("ストリーミングには正しいFPSが必要です。")
     output_path.parent.mkdir(parents=True,exist_ok=True)
@@ -116,14 +116,14 @@ def run_streaming_pipeline(input_path:Path,output_path:Path,width:int,height:int
             import psutil
             ram_available=int(psutil.virtual_memory().available)
         except Exception:ram_available=None
-        return _run_parallel_drawing(input_path,output_path,width,height,fps,frame_count,settings,ram_available,progress_callback,stop_event,copy_audio=copy_audio)
+        return _run_parallel_drawing(input_path,output_path,width,height,fps,frame_count,settings,ram_available,progress_callback,stop_event,copy_audio=copy_audio,hz_delay_ms=hz_delay_ms)
     frame_size=width*height*3;qsize=max(1,queue_frames or DEFAULT_QUEUE_FRAMES);stop=stop_event or threading.Event()
     from queue import Queue,Empty,Full
     raw_queue=Queue(maxsize=qsize);encoded_queue=Queue(maxsize=qsize);errors=[];stats=StreamingStats(started=time.perf_counter())
     decoder=subprocess.Popen(["ffmpeg","-hide_banner","-loglevel","error","-i",str(input_path),"-map","0:v:0","-f","rawvideo","-pix_fmt","rgb24","-threads",str(max(1,threads)),"pipe:1"],stdout=subprocess.PIPE,stderr=subprocess.PIPE,bufsize=0)
     audio_path=None;generated_audio=False;encoder=None
     try:
-        audio_path,generated_audio=_prepare_audio(input_path,copy_audio)
+        audio_path,generated_audio=_prepare_audio(input_path,copy_audio,delay_ms=hz_delay_ms)
         encoder_cmd=["ffmpeg","-hide_banner","-loglevel","error","-f","rawvideo","-pix_fmt","rgb24","-s",f"{width}x{height}","-r",f"{fps:.12g}","-i","pipe:0"]
         if audio_path is not None:
             encoder_cmd += ["-i",str(audio_path),"-map","0:v:0","-map","1:a?","-c:a","aac","-b:a","192k"] if generated_audio else ["-i",str(audio_path),"-map","0:v:0","-map","1:a?","-c:a","copy"]
