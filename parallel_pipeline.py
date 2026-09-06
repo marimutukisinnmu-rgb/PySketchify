@@ -27,6 +27,7 @@ def _worker_loop(worker_id, task_queue, result_queue, width, height, settings):
         pass
     from sketch_renderer import make_processor
     processor = make_processor(settings)
+    print(f"[WORKER {worker_id}] canvas={width}x{height}", flush=True)
     while True:
         try:
             task = task_queue.get()
