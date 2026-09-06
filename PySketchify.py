@@ -39,6 +39,7 @@ VERSION = "0.6.0"
 DEFAULT_MARGIN_GB = 0.9
 DEFAULT_OUTPUT_SUFFIX = "_pysketchify"
 SUPPORTED_INPUT_EXTENSIONS = {".mp4", ".webm", ".mov", ".wmv", ".avi", ".mkv", ".mts", ".m2ts", ".avchd"}
+DEFAULT_HZ_DELAY_MS = 1.93
 
 @dataclass
 class VideoInfo:
@@ -140,29 +141,29 @@ class ProcessingSession:
 def make_pencil_settings(width_var,pen_var):
     if PencilSettings is None:raise RuntimeError("numpy / Pillow が必要です。pip install numpy pillow")
     return PencilSettings(width=int(width_var.get()),pen_type=pen_var.get()).normalized()
-def run_video(info:VideoInfo,session:ProcessingSession,settings,progress_callback=None,copy_audio=True):
+def run_video(info:VideoInfo,session:ProcessingSession,settings,progress_callback=None,hz_mode=False,hz_delay_ms=DEFAULT_HZ_DELAY_MS):
     if run_streaming_pipeline is None or make_processor is None:raise RuntimeError("必要なモジュールを読み込めません。streaming_pipeline.py / sketch_renderer.py を確認してください。")
     resources=get_resource_snapshot();q=choose_queue_frames(info.width,info.height,resources.ram_available) if choose_queue_frames else 1
     if info.width*info.height*3>30_000_000:q=1
-    print(f"[STREAM] {info.width}x{info.height} | queue={q} frame | RAM空き={format_bytes(resources.ram_available) if resources.ram_available else '不明'} | audio_copy={'ON' if copy_audio else 'OFF'}")
+    print(f"[STREAM] {info.width}x{info.height} | queue={q} frame | RAM空き={format_bytes(resources.ram_available) if resources.ram_available else '不明'} | hz_mode={'ON' if hz_mode else 'OFF'} | delay={hz_delay_ms:.2f} ms")
     processor=make_processor(settings);last=[0.0]
     def callback(stats):
         if progress_callback:progress_callback(stats)
         now=time.perf_counter()
         if now-last[0]>=0.25 or (info.frame_count and stats.frames>=info.frame_count):
             last[0]=now;print(f"処理中... | {stats.frames:,}/{info.frame_count:,} frame | {stats.frame_rate:.1f} frame/s")
-    return run_streaming_pipeline(session.input_path,session.output_path,info.width,info.height,info.fps,info.frame_count,processor=processor,queue_frames=q,threads=1,progress_callback=callback,stop_event=session.stop_event,copy_audio=copy_audio)
+    return run_streaming_pipeline(session.input_path,session.output_path,info.width,info.height,info.fps,info.frame_count,processor=processor,queue_frames=q,threads=1,progress_callback=callback,stop_event=session.stop_event,copy_audio=hz_mode,hz_delay_ms=hz_delay_ms)
 
 class PySketchifyApp:
     def __init__(self,root:tk.Tk):
         self.root=root;self.root.title(f"{APP_NAME} {VERSION}");self.root.geometry("1080x800");self.session=None;self.info=None;self.completed_frames=0;self.processing_frames=0;self.waiting_frames=0
-        self.input_var=tk.StringVar();self.temp_var=tk.StringVar(value=str(default_temp_dir()));self.output_var=tk.StringVar();self.status_var=tk.StringVar(value="入力動画を選択してください。");self.progress_var=tk.DoubleVar(value=0);self.stats_var=tk.StringVar(value="処理済み：0 枚  処理中：0 枚  処理待ち：0 枚");self.resource_var=tk.StringVar();self.info_var=tk.StringVar(value="未選択");self.pen_width_var=tk.IntVar(value=3);self.pen_type_var=tk.StringVar(value="●");self.copy_audio_var=tk.BooleanVar(value=False);self._build();self.root.protocol("WM_DELETE_WINDOW",self.close)
+        self.input_var=tk.StringVar();self.temp_var=tk.StringVar(value=str(default_temp_dir()));self.output_var=tk.StringVar();self.status_var=tk.StringVar(value="入力動画を選択してください。");self.progress_var=tk.DoubleVar(value=0);self.stats_var=tk.StringVar(value="処理済み：0 枚  処理中：0 枚  処理待ち：0 枚");self.resource_var=tk.StringVar();self.info_var=tk.StringVar(value="未選択");self.pen_width_var=tk.IntVar(value=3);self.pen_type_var=tk.StringVar(value="●");self.copy_audio_var=tk.BooleanVar(value=False);self.hz_delay_var=tk.DoubleVar(value=DEFAULT_HZ_DELAY_MS);self._build();self.root.protocol("WM_DELETE_WINDOW",self.close)
     def _path_row(self,parent,label,variable,command,button_text="参照"):
         row=ttk.Frame(parent);row.pack(fill="x",pady=4);ttk.Label(row,text=label,width=22).pack(side="left");ttk.Entry(row,textvariable=variable).pack(side="left",fill="x",expand=True);ttk.Button(row,text=button_text,command=command).pack(side="left",padx=(8,0))
     def _build(self):
         main=ttk.Frame(self.root,padding=14);main.pack(fill="both",expand=True);ttk.Label(main,text=APP_NAME,font=("Segoe UI",20,"bold")).pack(anchor="w");ttk.Label(main,text="動画 → 内部自動お絵描き → 手描き風動画",font=("Segoe UI",10)).pack(anchor="w",pady=(0,12))
         paths=ttk.LabelFrame(main,text="入出力",padding=10);paths.pack(fill="x");self._path_row(paths,"入力先",self.input_var,self.choose_input,"動画を選択");self._path_row(paths,"一時ファイル場所（任意）",self.temp_var,self.choose_temp,"変更");ttk.Label(paths,text="未指定なら (pyがある場所)/tmp。処理終了後にtmpを削除します。").pack(anchor="w",padx=(22,0));self._path_row(paths,"出力先",self.output_var,self.choose_output,"保存先")
-        controls=ttk.LabelFrame(main,text="ペン設定 / 音声",padding=10);controls.pack(fill="x",pady=10);ttk.Button(controls,text="ペンの太さ(px)",command=self.open_pen_width_dialog).pack(side="left");ttk.Label(controls,textvariable=self.pen_width_var,width=6).pack(side="left",padx=(6,18));ttk.Label(controls,text="ペンの種類").pack(side="left");ttk.Combobox(controls,textvariable=self.pen_type_var,values=PEN_TYPES,state="readonly",width=6).pack(side="left",padx=6);ttk.Label(controls,text="●=丸  ■=角  ▲=三角").pack(side="left",padx=10);ttk.Checkbutton(controls,text="Hzを合成",variable=self.copy_audio_var).pack(side="left",padx=(18,0))
+        controls=ttk.LabelFrame(main,text="ペン設定 / 音声",padding=10);controls.pack(fill="x",pady=10);ttk.Button(controls,text="ペンの太さ(px)",command=self.open_pen_width_dialog).pack(side="left");ttk.Label(controls,textvariable=self.pen_width_var,width=6).pack(side="left",padx=(6,18));ttk.Label(controls,text="ペンの種類").pack(side="left");ttk.Combobox(controls,textvariable=self.pen_type_var,values=PEN_TYPES,state="readonly",width=6).pack(side="left",padx=6);ttk.Label(controls,text="●=丸  ■=角  ▲=三角").pack(side="left",padx=10);ttk.Checkbutton(controls,text="Hzを合成",variable=self.copy_audio_var).pack(side="left",padx=(18,0));ttk.Label(controls,text="係数(ms)").pack(side="left",padx=(14,4));ttk.Scale(controls,from_=0.0,to=10.0,variable=self.hz_delay_var,orient="horizontal",length=150).pack(side="left");ttk.Label(controls,textvariable=self.hz_delay_var,width=6).pack(side="left",padx=(4,0))
         info_frame=ttk.LabelFrame(main,text="動画情報 / リソース",padding=10);info_frame.pack(fill="x");ttk.Label(info_frame,textvariable=self.info_var).pack(anchor="w");ttk.Label(info_frame,textvariable=self.resource_var).pack(anchor="w",pady=(6,0))
         preview=ttk.LabelFrame(main,text="処理中 / プレビュー",padding=10);preview.pack(fill="both",expand=True);ttk.Label(preview,text="処理中の最新フレームをここへ表示します。\n内部で解析 → ストローク生成 → 描画 → FFmpegエンコードを行います。",anchor="center",justify="center").pack(fill="both",expand=True)
         ttk.Progressbar(main,variable=self.progress_var,maximum=100).pack(fill="x",pady=(10,4));ttk.Label(main,textvariable=self.stats_var).pack(anchor="w");ttk.Label(main,textvariable=self.status_var).pack(anchor="w",pady=(4,8));buttons=ttk.Frame(main);buttons.pack(fill="x");self.start_button=ttk.Button(buttons,text="処理開始",command=self.start);self.start_button.pack(side="left");self.stop_button=ttk.Button(buttons,text="停止",command=self.stop,state="disabled");self.stop_button.pack(side="left",padx=8)
@@ -183,7 +184,7 @@ class PySketchifyApp:
         if path:self.output_var.set(str(Path(path).resolve()))
     def analyze_input(self):
         try:
-            self.info=probe_video(Path(self.input_var.get()));resources=get_resource_snapshot();temp=Path(self.temp_var.get()) if self.temp_var.get() else default_temp_dir();temp.mkdir(parents=True,exist_ok=True);free=shutil.disk_usage(temp).free;audio_state="ON" if self.copy_audio_var.get() else "OFF";self.info_var.set(f"{self.info.width} × {self.info.height} | {self.info.fps:.6g} FPS | {self.info.frame_count:,} frame | audio {self.info.audio_streams} | subtitle {self.info.subtitle_streams}\n内部自動お絵描き: ON | Hz合成: {audio_state} | 一時先空き: {format_bytes(free)}");self.resource_var.set(f"GPU: {', '.join(resources.gpu_names) if resources.gpu_names else '検出情報なし'} | RAM空き: {format_bytes(resources.ram_available) if resources.ram_available is not None else '不明'} | 専用VRAM総量: {format_bytes(resources.vram_dedicated_total) if resources.vram_dedicated_total is not None else '不明'}");self.status_var.set("解析完了。ペン設定と音声設定を確認して処理開始できます。")
+            self.info=probe_video(Path(self.input_var.get()));resources=get_resource_snapshot();temp=Path(self.temp_var.get()) if self.temp_var.get() else default_temp_dir();temp.mkdir(parents=True,exist_ok=True);free=shutil.disk_usage(temp).free;audio_state="ON" if self.copy_audio_var.get() else "OFF";self.info_var.set(f"{self.info.width} × {self.info.height} | {self.info.fps:.6g} FPS | {self.info.frame_count:,} frame | audio {self.info.audio_streams} | subtitle {self.info.subtitle_streams}\n内部自動お絵描き: ON | Hz合成: {audio_state} | 係数: {self.hz_delay_var.get():.2f} ms | 一時先空き: {format_bytes(free)}");self.resource_var.set(f"GPU: {', '.join(resources.gpu_names) if resources.gpu_names else '検出情報なし'} | RAM空き: {format_bytes(resources.ram_available) if resources.ram_available is not None else '不明'} | 専用VRAM総量: {format_bytes(resources.vram_dedicated_total) if resources.vram_dedicated_total is not None else '不明'}");self.status_var.set("解析完了。ペン設定と音声設定を確認して処理開始できます。")
         except Exception as exc:self.info=None;self.status_var.set(f"解析エラー: {exc}");messagebox.showerror(APP_NAME,str(exc))
     def start(self):
         if not self.input_var.get():self.choose_input()
@@ -194,13 +195,13 @@ class PySketchifyApp:
         if output.exists() and not messagebox.askyesno(APP_NAME,f"出力ファイルが既にあります。上書きしますか？\n\n{output}"):return
         try:settings=make_pencil_settings(self.pen_width_var,self.pen_type_var)
         except Exception as exc:messagebox.showerror(APP_NAME,str(exc));return
-        temp=Path(self.temp_var.get()).expanduser().resolve() if self.temp_var.get() else default_temp_dir();self.session=ProcessingSession(Path(self.input_var.get()),temp_dir=temp,output_path=output);self.start_button.config(state="disabled");self.stop_button.config(state="normal");self.progress_var.set(0);self.completed_frames=0;self.processing_frames=0;self.waiting_frames=self.info.frame_count;self._update_live_counts();threading.Thread(target=self._worker,args=(settings,not self.copy_audio_var.get()),daemon=True).start()
-    def _worker(self,settings,copy_audio):
+        temp=Path(self.temp_var.get()).expanduser().resolve() if self.temp_var.get() else default_temp_dir();self.session=ProcessingSession(Path(self.input_var.get()),temp_dir=temp,output_path=output);self.start_button.config(state="disabled");self.stop_button.config(state="normal");self.progress_var.set(0);self.completed_frames=0;self.processing_frames=0;self.waiting_frames=self.info.frame_count;self._update_live_counts();threading.Thread(target=self._worker,args=(settings,self.copy_audio_var.get(),self.hz_delay_var.get()),daemon=True).start()
+    def _worker(self,settings,hz_mode,hz_delay_ms):
         assert self.session and self.info
         try:
             def progress(stats):
                 self.completed_frames=stats.frames;self.processing_frames=0 if stats.frames>=self.info.frame_count else 1;self.waiting_frames=max(0,self.info.frame_count-self.completed_frames-self.processing_frames);percent=stats.frames/self.info.frame_count*100 if self.info.frame_count else 0;self.root.after(0,self._update_stream_progress,percent,stats.frame_rate)
-            run_video(self.info,self.session,settings,progress,copy_audio=copy_audio)
+            run_video(self.info,self.session,settings,progress,hz_mode=hz_mode,hz_delay_ms=hz_delay_ms)
             if not self.session.stop_requested:self.completed_frames=self.info.frame_count
             self.processing_frames=0;self.waiting_frames=max(0,self.info.frame_count-self.completed_frames);self.root.after(0,self._worker_done)
         except Exception as exc:self.root.after(0,self._worker_error,str(exc))
