@@ -15,7 +15,8 @@ DEFAULT_CHANNELS = 2
 DEFAULT_CHUNK = 65536
 DEFAULT_BANDS = 256
 DEFAULT_REPEATS = 3
-MAX_BAND_DELAY_MS = 7.0
+MIN_BAND_DELAY_MS = -3.0
+MAX_BAND_DELAY_MS = 3.0
 
 
 def _decode_audio(input_path: Path) -> bytes:
@@ -42,19 +43,18 @@ def _split_recombine(
     rng: np.random.Generator,
 ) -> np.ndarray:
     """
-    Split the signal into frequency bands, apply an independent +/-7 ms
-    time offset to each band as a frequency-domain phase shift, recombine,
-    and repeat the operation.
+    Split the signal into frequency bands, apply an independent random
+    -3..+3 ms time offset to each band as a frequency-domain phase shift,
+    recombine, and repeat the operation.
     """
     out = signal.astype(np.float32, copy=True)
     bands = max(2, DEFAULT_BANDS)
+    min_delay_seconds = MIN_BAND_DELAY_MS / 1000.0
     max_delay_seconds = MAX_BAND_DELAY_MS / 1000.0
 
     for _ in range(max(1, int(repeats))):
-        # One delay per band for this pass. Keeping the delay stable across
-        # chunks avoids random discontinuities at chunk boundaries.
         band_delays = rng.uniform(
-            -max_delay_seconds,
+            min_delay_seconds,
             max_delay_seconds,
             size=bands,
         ).astype(np.float64)
@@ -78,7 +78,6 @@ def _split_recombine(
                 isolated = np.zeros_like(spectrum)
                 isolated[lo:hi] = spectrum[lo:hi]
 
-                # A time shift of +tau is a phase rotation exp(-j*2*pi*f*tau).
                 phase = np.exp(
                     -2j * np.pi * frequencies[lo:hi] * band_delays[band]
                 )
@@ -106,9 +105,7 @@ def make_hz_audio(input_path: Path, repeats: int = DEFAULT_REPEATS) -> Path | No
         return None
 
     samples = samples[:usable].reshape(-1, DEFAULT_CHANNELS)
-    # Fixed seed keeps repeated renders deterministic while still giving
-    # every frequency band its own independent +/-7 ms offset.
-    rng = np.random.default_rng(20260907)
+    rng = np.random.default_rng()
     processed = np.stack(
         [_split_recombine(samples[:, ch], repeats, rng) for ch in range(DEFAULT_CHANNELS)],
         axis=1,
