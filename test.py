@@ -41,12 +41,20 @@ def main():
     print("=" * 60)
 
     cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error", "-i", video,
-        "-map", "0:v:0", "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-i", video,
+        "-map", "0:v:0",
+        "-f", "rawvideo",
+        "-pix_fmt", "rgb24",
+        "-",
     ]
 
     process = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         bufsize=frame_size * 2,
     )
 
@@ -58,17 +66,23 @@ def main():
             data = process.stdout.read(frame_size)
             if not data:
                 break
+
             frame_number += 1
 
             if frame_number == 100:
-                # 描画処理なし。受信したdataをそのまま保存。
-                frame_100 = data
+                # 描画処理を一切せず、受信したdataをそのまま返す。
+                output_data = data
+                frame_100 = output_data
+
                 print("\n--- 100 frame ---")
-                print(f"受信した data       = {len(data)} bytes")
-                print(f"width × height × 3 = {frame_size} bytes")
-                print(f"data == width × height × 3 : {len(data) == frame_size}")
-                print("描画処理            = なし")
-                print("返却する data       = 受信した data そのまま")
+                print(f"受信 data            = {len(data)} bytes")
+                print(f"入力 frame_size      = {frame_size} bytes")
+                print(f"output_data          = {len(output_data)} bytes")
+                print(f"data is output_data  = {data is output_data}")
+                print(f"data == output_data  = {data == output_data}")
+                print("描画処理             = なし")
+                print("変換処理             = なし")
+                print("返却                 = dataそのまま")
                 print("-------------------")
                 break
     finally:
@@ -80,11 +94,13 @@ def main():
         print("100 frame目を取得できませんでした。")
         return
 
-    # 加工していないRGB24 dataを表示する。
+    # output_dataを加工せず、そのまま表示する。
     root = tk.Tk()
     root.title(f"PySketchify test.py - frame 100 ({width}x{height})")
+
     ppm = f"P6\n{width} {height}\n255\n".encode("ascii") + frame_100
     image = tk.PhotoImage(data=ppm, format="PPM")
+
     label = tk.Label(root, image=image)
     label.pack()
     root.mainloop()
